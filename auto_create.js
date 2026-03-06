@@ -399,7 +399,15 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
     try {
         // Step 1: Navigate to hiring portal
         log('INFO', 'Navigating to hiring.amazon.ca...', accountNum);
-        await page.goto('https://hiring.amazon.ca/', { waitUntil: 'networkidle', timeout: 30000 });
+        // Use domcontentloaded instead of networkidle — proxy connections can be slow
+        // and third-party scripts (captcha SDK, analytics) may never fully settle
+        await page.goto('https://hiring.amazon.ca/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // Give extra time for page to render
+        try {
+            await page.waitForLoadState('networkidle', { timeout: 15000 });
+        } catch (e) {
+            log('DEBUG', 'networkidle not reached, continuing anyway...', accountNum);
+        }
         await page.waitForTimeout(2000);
 
         // Dismiss any popups
