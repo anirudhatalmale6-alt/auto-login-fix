@@ -26,5 +26,11 @@
     "page_load_timeout": 30000,
     "action_delay": 1000,
     "concurrent_limit": 10
+  },
+  "captcha": {
+    "solver": "nopecha",
+    "api_key": "YOUR_NOPECHA_API_KEY",
+    "max_attempts": 3,
+    "timeout": 60000
   }
 }

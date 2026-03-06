@@ -7,6 +7,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const chokidar = require('chokidar');
+const { Configuration, NopeCHAApi } = require('nopecha');
 
 // Configure logging
 const logFile = fs.createWriteStream('auto_login.log', { flags: 'a' });
@@ -54,6 +55,20 @@ class AccountSession {
         this.page = null;
         this.lastLoginTime = null;
         this.csrfToken = null; // Store CSRF token for requests
+
+        // Initialize NopeCHA solver if configured
+        this.nopecha = null;
+        if (config.captcha && config.captcha.api_key) {
+            try {
+                const nopechaConfig = new Configuration({
+                    apiKey: config.captcha.api_key,
+                });
+                this.nopecha = new NopeCHAApi(nopechaConfig);
+                log('INFO', 'NopeCHA CAPTCHA solver initialized', this.accountId);
+            } catch (e) {
+                log('WARNING', `Failed to initialize NopeCHA: ${e.message}`, this.accountId);
+            }
+        }
     }
 
     async initContext() {
@@ -1272,48 +1287,126 @@ class AccountSession {
                 log('INFO', 'Proceeding without captcha handling...', this.accountId);
             }
             
+            // Solve CAPTCHA using NopeCHA if audio button was clicked
+            let captchaSolved = false;
             if (captchaAudioButtonClicked) {
                 await this.page.waitForTimeout(this.config.timing.action_delay);
-                log('INFO', 'Waiting for captcha audio to process...', this.accountId);
-                await this.page.waitForTimeout(2000);
+                log('INFO', 'Audio button clicked, now solving CAPTCHA...', this.accountId);
+
+                const maxCaptchaAttempts = (this.config.captcha && this.config.captcha.max_attempts) || 3;
+                const captchaTimeout = (this.config.captcha && this.config.captcha.timeout) || 60000;
+
+                for (let attempt = 1; attempt <= maxCaptchaAttempts; attempt++) {
+                    try {
+                        log('INFO', `CAPTCHA solve attempt ${attempt}/${maxCaptchaAttempts}`, this.accountId);
+                        captchaSolved = await this._solveCaptchaAudio(captchaTimeout);
+                        if (captchaSolved) {
+                            log('INFO', 'CAPTCHA solved successfully!', this.accountId);
+                            break;
+                        } else {
+                            log('WARNING', `CAPTCHA solve attempt ${attempt} failed`, this.accountId);
+                            if (attempt < maxCaptchaAttempts) {
+                                // Try refreshing the audio challenge
+                                log('INFO', 'Requesting new audio challenge...', this.accountId);
+                                const refreshBtn = await this.page.$('#captchaModal button[aria-label="Get a new challenge"], #captchaModal .refresh-button, #captchaModal [data-test-id="refresh"]');
+                                if (refreshBtn) {
+                                    await refreshBtn.click({ force: true });
+                                    await this.page.waitForTimeout(2000);
+                                }
+                                // Re-click audio button
+                                const audioBtn = await this.page.$('#amzn-btn-audio-internal');
+                                if (audioBtn) {
+                                    await audioBtn.click({ force: true });
+                                    await this.page.waitForTimeout(2000);
+                                }
+                            }
+                        }
+                    } catch (solveError) {
+                        log('ERROR', `CAPTCHA solve error (attempt ${attempt}): ${solveError.message}`, this.accountId);
+                    }
+                }
             } else if (captchaModalFound) {
                 log('WARNING', 'Captcha modal found but audio button not clicked', this.accountId);
             }
 
+            // Wait for captcha overlay to clear after solving
+            if (captchaSolved) {
+                log('INFO', 'Waiting for CAPTCHA overlay to clear...', this.accountId);
+                try {
+                    await this.page.waitForFunction(() => {
+                        const overlay = document.querySelector('#captchaModalOverlay');
+                        if (!overlay) return true;
+                        const style = window.getComputedStyle(overlay);
+                        return style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none';
+                    }, { timeout: 15000 });
+                    log('INFO', 'CAPTCHA overlay cleared', this.accountId);
+                    await this.page.waitForTimeout(1000);
+                } catch (e) {
+                    log('WARNING', 'CAPTCHA overlay did not clear, trying to proceed anyway...', this.accountId);
+                }
+            }
+
             // Find and click final login/submit button
-            // After send code button, look for the submit button (might be StencilReactButton or another button)
             log('INFO', 'Looking for final login/submit button', this.accountId);
             let loginButtonSelector;
             let loginButtonClicked = false;
-            
-            // Try to find StencilReactButton that is visible and enabled (should be the submit button after PIN)
+
+            // Try to find StencilReactButton that is visible and enabled
             try {
-                // Wait a bit for the button to be ready
                 await this.page.waitForTimeout(500);
-                
-                // Get all StencilReactButton elements
+
                 const buttons = await this.page.$$('button[data-test-component="StencilReactButton"]');
                 log('INFO', `Found ${buttons.length} StencilReactButton(s) on page`, this.accountId);
-                
-                // Find the one that is visible and enabled (likely the submit button)
+
                 for (let i = 0; i < buttons.length; i++) {
                     const isVisible = await buttons[i].isVisible();
                     const isEnabled = await buttons[i].isEnabled();
                     log('DEBUG', `Button ${i + 1}: visible=${isVisible}, enabled=${isEnabled}`, this.accountId);
-                    
+
                     if (isVisible && isEnabled) {
-                        // This is likely the submit button
                         log('INFO', `Clicking StencilReactButton ${i + 1} as submit button`, this.accountId);
-                        await buttons[i].click();
-                        loginButtonClicked = true;
-                        break;
+                        try {
+                            await buttons[i].click({ timeout: 5000 });
+                            loginButtonClicked = true;
+                            break;
+                        } catch (clickErr) {
+                            if (clickErr.message.includes('intercepts pointer events')) {
+                                log('WARNING', 'Submit button blocked by overlay, trying force click...', this.accountId);
+                                await buttons[i].click({ force: true, timeout: 5000 });
+                                loginButtonClicked = true;
+                                break;
+                            }
+                            throw clickErr;
+                        }
                     }
                 }
             } catch (error) {
                 log('WARNING', `Error finding StencilReactButton: ${error.message}`, this.accountId);
             }
-            
-            // If StencilReactButton wasn't clicked, try alternative selectors
+
+            // Fallback: try JS click or alternative selectors
+            if (!loginButtonClicked) {
+                try {
+                    // Try JavaScript click to bypass overlay
+                    const clicked = await this.page.evaluate(() => {
+                        const buttons = document.querySelectorAll('button[data-test-component="StencilReactButton"]');
+                        for (const btn of buttons) {
+                            if (btn.offsetParent !== null) { // visible
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                    if (clicked) {
+                        log('INFO', 'Submit button clicked via JavaScript', this.accountId);
+                        loginButtonClicked = true;
+                    }
+                } catch (e) {
+                    log('DEBUG', `JS click fallback failed: ${e.message}`, this.accountId);
+                }
+            }
+
             if (!loginButtonClicked) {
                 try {
                     loginButtonSelector = await this._findSelector(this.config.selectors.login_button, 10000);
@@ -1346,6 +1439,275 @@ class AccountSession {
             }
         } catch (error) {
             log('ERROR', `Login error: ${error.message}`, this.accountId);
+            return false;
+        }
+    }
+
+    /**
+     * Solve the AWS WAF audio CAPTCHA using NopeCHA API.
+     * Flow: extract audio base64 → send to NopeCHA → get transcription → type answer → submit
+     */
+    async _solveCaptchaAudio(timeout = 60000) {
+        if (!this.nopecha) {
+            log('ERROR', 'NopeCHA not configured - set captcha.api_key in config.json', this.accountId);
+            return false;
+        }
+
+        try {
+            // Step 1: Wait for <audio> element to appear with base64 data
+            log('INFO', 'Waiting for audio element with base64 data...', this.accountId);
+
+            let audioData = null;
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < 15000) {
+                audioData = await this.page.evaluate(() => {
+                    // Check for audio elements anywhere on the page
+                    const audioElements = document.querySelectorAll('audio');
+                    for (const audio of audioElements) {
+                        const src = audio.src || audio.currentSrc;
+                        if (src && src.startsWith('data:audio')) {
+                            // Extract base64 part after the mime type prefix
+                            const base64Match = src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                            if (base64Match) return base64Match[1];
+                        }
+                        // Also check <source> children
+                        const sources = audio.querySelectorAll('source');
+                        for (const source of sources) {
+                            if (source.src && source.src.startsWith('data:audio')) {
+                                const base64Match = source.src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                                if (base64Match) return base64Match[1];
+                            }
+                        }
+                    }
+                    return null;
+                });
+
+                if (audioData) {
+                    log('INFO', `Audio data extracted (${audioData.length} chars base64)`, this.accountId);
+                    break;
+                }
+                await this.page.waitForTimeout(500);
+            }
+
+            if (!audioData) {
+                // Try alternative: intercept audio from network requests
+                log('WARNING', 'No base64 audio element found, checking for audio URL...', this.accountId);
+
+                // Look for any audio source URL
+                const audioUrl = await this.page.evaluate(() => {
+                    const audioElements = document.querySelectorAll('audio');
+                    for (const audio of audioElements) {
+                        const src = audio.src || audio.currentSrc;
+                        if (src && !src.startsWith('data:') && src.length > 0) return src;
+                        const sources = audio.querySelectorAll('source');
+                        for (const source of sources) {
+                            if (source.src && !source.src.startsWith('data:')) return source.src;
+                        }
+                    }
+                    return null;
+                });
+
+                if (audioUrl) {
+                    log('INFO', `Found audio URL: ${audioUrl}`, this.accountId);
+                    // Download and convert to base64
+                    try {
+                        const response = await this.page.context().request.get(audioUrl);
+                        const buffer = await response.body();
+                        audioData = buffer.toString('base64');
+                        log('INFO', `Downloaded audio (${audioData.length} chars base64)`, this.accountId);
+                    } catch (dlError) {
+                        log('ERROR', `Failed to download audio: ${dlError.message}`, this.accountId);
+                    }
+                }
+            }
+
+            if (!audioData) {
+                log('ERROR', 'Could not extract audio data from CAPTCHA', this.accountId);
+
+                // Dump DOM for debugging
+                const captchaHTML = await this.page.evaluate(() => {
+                    const modal = document.querySelector('#captchaModal');
+                    return modal ? modal.innerHTML.substring(0, 2000) : 'modal not found';
+                });
+                log('DEBUG', `Captcha modal HTML (first 2000 chars): ${captchaHTML}`, this.accountId);
+                return false;
+            }
+
+            // Step 2: Send audio to NopeCHA for transcription
+            log('INFO', 'Sending audio to NopeCHA for transcription...', this.accountId);
+
+            let answer = null;
+            try {
+                const result = await this.nopecha.solveRecognition({
+                    type: 'awscaptcha',
+                    audio_data: [audioData],
+                });
+
+                if (result && result.length > 0) {
+                    answer = result[0];
+                    log('INFO', `NopeCHA transcription: "${answer}"`, this.accountId);
+                } else {
+                    log('ERROR', 'NopeCHA returned empty result', this.accountId);
+                    return false;
+                }
+            } catch (nopechaError) {
+                log('ERROR', `NopeCHA API error: ${nopechaError.message}`, this.accountId);
+                return false;
+            }
+
+            // Step 3: Find the input field and type the answer
+            log('INFO', 'Typing CAPTCHA answer into input field...', this.accountId);
+
+            const inputTyped = await this.page.evaluate((answer) => {
+                // Look for text input inside captcha modal
+                const modal = document.querySelector('#captchaModal');
+                const searchRoots = modal ? [modal, document] : [document];
+
+                for (const root of searchRoots) {
+                    // Try various input selectors
+                    const selectors = [
+                        'input[type="text"]',
+                        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                        'input[placeholder]',
+                        'input[aria-label*="captcha" i]',
+                        'input[aria-label*="answer" i]',
+                        'input[aria-label*="type" i]',
+                        '#captcha-guess-input',
+                        '#captchaGuess',
+                    ];
+
+                    for (const sel of selectors) {
+                        const input = root.querySelector(sel);
+                        if (input && input.offsetParent !== null) {
+                            // Clear and set value
+                            input.value = '';
+                            input.focus();
+                            // Use native input setter to trigger React/framework events
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(input, answer);
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                            return { success: true, selector: sel, id: input.id };
+                        }
+                    }
+                }
+                return { success: false };
+            }, answer);
+
+            if (!inputTyped.success) {
+                log('WARNING', 'Could not find input via evaluate, trying Playwright fill...', this.accountId);
+                // Fallback: try Playwright's fill method with various selectors
+                const inputSelectors = [
+                    '#captchaModal input[type="text"]',
+                    '#captchaModal input:not([type="hidden"])',
+                    '#captcha-guess-input',
+                    '#captchaGuess',
+                    'input[type="text"]',
+                ];
+                let filled = false;
+                for (const sel of inputSelectors) {
+                    try {
+                        const input = await this.page.$(sel);
+                        if (input && await input.isVisible()) {
+                            await input.fill(answer);
+                            log('INFO', `Typed answer using Playwright fill (${sel})`, this.accountId);
+                            filled = true;
+                            break;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                if (!filled) {
+                    log('ERROR', 'Could not find CAPTCHA input field to type answer', this.accountId);
+                    return false;
+                }
+            } else {
+                log('INFO', `Typed answer into input (selector: ${inputTyped.selector}, id: ${inputTyped.id})`, this.accountId);
+            }
+
+            await this.page.waitForTimeout(500);
+
+            // Step 4: Click the CAPTCHA verify/submit button
+            log('INFO', 'Looking for CAPTCHA verify/submit button...', this.accountId);
+
+            const captchaSubmitted = await this.page.evaluate(() => {
+                const modal = document.querySelector('#captchaModal');
+                const searchRoots = modal ? [modal, document] : [document];
+
+                for (const root of searchRoots) {
+                    const selectors = [
+                        'button[type="submit"]',
+                        'button:not([id="amzn-btn-audio-internal"])',
+                        '[role="button"]',
+                    ];
+
+                    for (const sel of selectors) {
+                        const buttons = root.querySelectorAll(sel);
+                        for (const btn of buttons) {
+                            const text = (btn.textContent || '').toLowerCase().trim();
+                            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            // Look for submit/verify/confirm buttons
+                            if ((text.includes('submit') || text.includes('verify') || text.includes('confirm') ||
+                                 text.includes('continue') || text.includes('enter') ||
+                                 ariaLabel.includes('submit') || ariaLabel.includes('verify')) &&
+                                btn.offsetParent !== null) {
+                                btn.click();
+                                return { success: true, text: text.substring(0, 50) };
+                            }
+                        }
+                    }
+                }
+                return { success: false };
+            });
+
+            if (!captchaSubmitted.success) {
+                log('WARNING', 'Could not find CAPTCHA submit button via text, trying alternative methods...', this.accountId);
+                // Try pressing Enter as fallback
+                try {
+                    await this.page.keyboard.press('Enter');
+                    log('INFO', 'Pressed Enter to submit CAPTCHA', this.accountId);
+                } catch (e) {
+                    log('WARNING', `Enter key failed: ${e.message}`, this.accountId);
+                }
+            } else {
+                log('INFO', `CAPTCHA submit button clicked (text: "${captchaSubmitted.text}")`, this.accountId);
+            }
+
+            // Step 5: Wait for CAPTCHA to be verified
+            log('INFO', 'Waiting for CAPTCHA verification...', this.accountId);
+            await this.page.waitForTimeout(3000);
+
+            // Check if CAPTCHA overlay is gone (indicating success)
+            const overlayGone = await this.page.evaluate(() => {
+                const overlay = document.querySelector('#captchaModalOverlay');
+                if (!overlay) return true;
+                const style = window.getComputedStyle(overlay);
+                return style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none';
+            });
+
+            if (overlayGone) {
+                log('INFO', 'CAPTCHA overlay is gone - CAPTCHA appears solved!', this.accountId);
+                return true;
+            }
+
+            // Check if modal is still visible (CAPTCHA might have failed)
+            const modalStillVisible = await this.page.evaluate(() => {
+                const modal = document.querySelector('#captchaModal');
+                return modal && modal.offsetParent !== null;
+            });
+
+            if (!modalStillVisible) {
+                log('INFO', 'CAPTCHA modal disappeared - CAPTCHA appears solved!', this.accountId);
+                return true;
+            }
+
+            log('WARNING', 'CAPTCHA overlay still present after submission', this.accountId);
+            return false;
+
+        } catch (error) {
+            log('ERROR', `CAPTCHA solving error: ${error.message}`, this.accountId);
             return false;
         }
     }
