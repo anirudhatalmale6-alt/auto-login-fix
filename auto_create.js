@@ -835,11 +835,56 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             accountNum);
 
         // Re-enter mobile number (same value)
-        await fillField(page, 'confirmPhone', accountData.phone,
-            ['Re-enter mobile', 'Confirm mobile', 'Re-enter mobile number'],
-            ['Re-enter mobile', 're-enter mobile', 'Confirm mobile'],
-            ['input[name="confirmPhone"]', 'input[name="reenterPhone"]', 'input[name="confirmMobile"]', 'input[name="reenterMobileNumber"]', 'input[data-test-id*="confirmMobile" i]', 'input[data-test-id*="reenter" i]'],
+        let confirmPhoneFilled = await fillField(page, 'confirmPhone', accountData.phone,
+            ['Re-enter mobile number', 'Re-enter mobile'],
+            ['Re-enter the mobile number', 'Re-enter mobile'],
+            ['input[name="confirmPhone"]', 'input[name="reenterPhone"]', 'input[name="confirmMobile"]', 'input[name="reenterMobileNumber"]'],
             accountNum);
+
+        // Fallback: find all tel inputs, fill the first empty one
+        if (!confirmPhoneFilled) {
+            try {
+                const telInputs = await page.$$('input[type="tel"]');
+                log('DEBUG', `Found ${telInputs.length} tel inputs for confirmPhone`, accountNum);
+                for (const tel of telInputs) {
+                    if (await tel.isVisible()) {
+                        const val = await tel.inputValue();
+                        if (!val || val.trim() === '') {
+                            await tel.fill(accountData.phone);
+                            log('INFO', 'Filled confirmPhone via empty tel input', accountNum);
+                            confirmPhoneFilled = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Last fallback: JS native setter for React inputs
+        if (!confirmPhoneFilled) {
+            try {
+                const result = await page.evaluate((phone) => {
+                    const inputs = document.querySelectorAll('input[type="tel"], input[type="number"]');
+                    const visible = Array.from(inputs).filter(el => el.offsetParent !== null);
+                    for (const inp of visible) {
+                        if (!inp.value || inp.value.trim() === '') {
+                            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                            nativeSetter.call(inp, phone);
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                    }
+                    return false;
+                }, accountData.phone);
+                if (result) {
+                    log('INFO', 'Filled confirmPhone via JS native setter', accountNum);
+                    confirmPhoneFilled = true;
+                }
+            } catch (e) {}
+        }
+
+        if (!confirmPhoneFilled) log('WARNING', 'Could not fill re-enter mobile number', accountNum);
 
         // Select Preferred Language dropdown → English
         log('INFO', 'Selecting preferred language: English...', accountNum);
