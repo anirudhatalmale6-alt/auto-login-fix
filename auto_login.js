@@ -3,6 +3,8 @@
  * Handles token expiration and automatic re-login for 100 accounts.
  */
 
+const SCRIPT_VERSION = 'v7.0';
+
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -1484,11 +1486,18 @@ class AccountSession {
                 } catch (e) {}
 
                 // Check for OTP input field — Amazon may ask for a verification code
+                // Strategy 1: Named/attributed selectors
                 const otpSelectors = [
                     'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
+                    'input[name="otpCode"]', 'input[name="verifyCode"]', 'input[name="confirmCode"]',
                     'input[placeholder*="code" i]', 'input[placeholder*="otp" i]',
-                    'input[placeholder*="verification" i]', '#verificationCode', '#otp', '#code',
+                    'input[placeholder*="verification" i]', 'input[placeholder*="enter" i]',
+                    '#verificationCode', '#otp', '#code', '#otpCode',
                     'input[aria-label*="code" i]', 'input[aria-label*="verification" i]',
+                    'input[aria-label*="otp" i]',
+                    'input[type="tel"]', 'input[type="number"]',
+                    'input[data-test-id*="otp" i]', 'input[data-test-id*="code" i]',
+                    'input[data-test-id*="verify" i]',
                 ];
 
                 let otpFieldFound = false;
@@ -1504,8 +1513,58 @@ class AccountSession {
                     } catch (e) {}
                 }
 
+                // Strategy 2: Check page text for OTP-related keywords
+                if (!otpFieldFound) {
+                    try {
+                        const pageText = await this.page.evaluate(() => document.body.innerText.toLowerCase());
+                        const isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
+                            pageText.includes('enter the code') || pageText.includes('enter otp') ||
+                            pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
+                            pageText.includes('sent a code') || pageText.includes('verify your') ||
+                            pageText.includes('one-time') || pageText.includes('one time');
+
+                        if (isOtpPage) {
+                            log('INFO', 'Page text suggests OTP screen, looking for any visible text input...', this.accountId);
+                            // Find any visible text/tel/number input that's not email/password
+                            const genericInput = await this.page.evaluate(() => {
+                                const inputs = document.querySelectorAll('input');
+                                for (const inp of inputs) {
+                                    if (inp.offsetParent === null) continue; // hidden
+                                    const t = inp.type.toLowerCase();
+                                    if (t === 'hidden' || t === 'password' || t === 'email' || t === 'checkbox' || t === 'radio') continue;
+                                    const n = (inp.name || '').toLowerCase();
+                                    if (n === 'email' || n === 'login emailid' || n === 'username') continue;
+                                    return { found: true, name: inp.name, id: inp.id, type: inp.type };
+                                }
+                                return { found: false };
+                            });
+                            if (genericInput.found) {
+                                // Build a selector for this input
+                                if (genericInput.id) {
+                                    otpFieldSelector = `#${genericInput.id}`;
+                                } else if (genericInput.name) {
+                                    otpFieldSelector = `input[name="${genericInput.name}"]`;
+                                } else {
+                                    otpFieldSelector = `input[type="${genericInput.type}"]`;
+                                }
+                                otpFieldFound = true;
+                                log('INFO', `Found OTP input via page text detection: ${otpFieldSelector} (name=${genericInput.name}, id=${genericInput.id})`, this.accountId);
+                            }
+                        }
+                    } catch (e) {
+                        log('DEBUG', `Page text OTP detection error: ${e.message}`, this.accountId);
+                    }
+                }
+
                 if (otpFieldFound && this.config.email_imap) {
                     log('INFO', `OTP input detected (${otpFieldSelector}), fetching OTP from email...`, this.accountId);
+
+                    // Take debug screenshot before OTP
+                    try {
+                        await this.page.screenshot({ path: 'debug_otp_screen.png' });
+                        log('INFO', 'Debug screenshot saved: debug_otp_screen.png', this.accountId);
+                    } catch (e) {}
+
                     try {
                         const otp = await getOtpFromEmail(this.config.email_imap, this.account.email, 120000);
                         log('INFO', `OTP retrieved: ${otp}`, this.accountId);
@@ -1515,21 +1574,47 @@ class AccountSession {
                         if (otpInput) {
                             await otpInput.fill(otp);
                             log('INFO', 'OTP filled into input field', this.accountId);
-                            await this.page.waitForTimeout(1000);
+                            await this.page.waitForTimeout(1500);
                         }
 
-                        // Click Verify button immediately after OTP
-                        log('INFO', 'Looking for Verify button after OTP...', this.accountId);
+                        // Take debug screenshot after OTP fill
+                        try {
+                            await this.page.screenshot({ path: 'debug_otp_filled.png' });
+                            log('INFO', 'Debug screenshot saved: debug_otp_filled.png', this.accountId);
+                        } catch (e) {}
+
+                        // Click Verify/Continue button after OTP
+                        log('INFO', 'Looking for Verify/Continue button after OTP...', this.accountId);
                         let verifyClicked = false;
 
-                        // Try specific verify button selectors
+                        // Log all buttons on page for debugging
+                        try {
+                            const allButtons = await this.page.evaluate(() => {
+                                const btns = document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn, a.button');
+                                return Array.from(btns).map(b => ({
+                                    tag: b.tagName,
+                                    text: (b.textContent || b.value || '').trim().substring(0, 60),
+                                    visible: b.offsetParent !== null,
+                                    disabled: b.disabled,
+                                    testComponent: b.getAttribute('data-test-component'),
+                                    testId: b.getAttribute('data-test-id'),
+                                    classes: b.className.substring(0, 100)
+                                }));
+                            });
+                            log('INFO', `All buttons on page after OTP: ${JSON.stringify(allButtons)}`, this.accountId);
+                        } catch (e) {}
+
+                        // Try Playwright text-based selectors (case-insensitive matching)
                         const verifySelectors = [
                             'button:has-text("Verify")',
-                            'button:has-text("verify")',
-                            'button[data-test-id*="verify" i]',
-                            'button[aria-label*="verify" i]',
                             'button:has-text("Submit")',
                             'button:has-text("Confirm")',
+                            'button:has-text("Continue")',
+                            'button:has-text("Done")',
+                            'button:has-text("Next")',
+                            '[role="button"]:has-text("Verify")',
+                            '[role="button"]:has-text("Continue")',
+                            '[role="button"]:has-text("Submit")',
                         ];
 
                         for (const sel of verifySelectors) {
@@ -1549,16 +1634,18 @@ class AccountSession {
                             } catch (e) {}
                         }
 
-                        // Fallback: JS click on any button with verify/submit text
+                        // Fallback 1: JS click on any button with matching text
                         if (!verifyClicked) {
+                            log('INFO', 'Trying JS fallback for verify button...', this.accountId);
                             const jsClicked = await this.page.evaluate(() => {
-                                const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                                for (const btn of buttons) {
-                                    if (btn.offsetParent === null || btn.disabled) continue;
-                                    const text = (btn.textContent || btn.value || '').toLowerCase();
-                                    if (text.includes('verify') || text.includes('submit') || text.includes('confirm')) {
-                                        btn.click();
-                                        return (btn.textContent || btn.value || '').trim().substring(0, 60);
+                                const elements = document.querySelectorAll('button, [role="button"], input[type="submit"], a.btn, a.button, div[onclick], span[onclick]');
+                                const keywords = ['verify', 'submit', 'confirm', 'continue', 'done', 'next', 'send'];
+                                for (const el of elements) {
+                                    if (el.offsetParent === null || el.disabled) continue;
+                                    const text = (el.textContent || el.value || '').toLowerCase().trim();
+                                    if (keywords.some(kw => text.includes(kw))) {
+                                        el.click();
+                                        return (el.textContent || el.value || '').trim().substring(0, 60);
                                     }
                                 }
                                 return null;
@@ -1569,8 +1656,9 @@ class AccountSession {
                             }
                         }
 
-                        // Fallback: click StencilReactButton (Amazon's standard button)
+                        // Fallback 2: click StencilReactButton (Amazon's standard button)
                         if (!verifyClicked) {
+                            log('INFO', 'Trying StencilReactButton fallback...', this.accountId);
                             try {
                                 const stencilBtns = await this.page.$$('button[data-test-component="StencilReactButton"]');
                                 for (const btn of stencilBtns) {
@@ -1585,8 +1673,36 @@ class AccountSession {
                             } catch (e) {}
                         }
 
+                        // Fallback 3: LAST RESORT — click ANY visible, enabled button on the page
+                        if (!verifyClicked) {
+                            log('INFO', 'Last resort: clicking any visible button on OTP page...', this.accountId);
+                            const lastResort = await this.page.evaluate(() => {
+                                const buttons = document.querySelectorAll('button, input[type="submit"]');
+                                for (const btn of buttons) {
+                                    if (btn.offsetParent === null || btn.disabled) continue;
+                                    const text = (btn.textContent || btn.value || '').trim();
+                                    // Skip obvious non-verify buttons
+                                    const lower = text.toLowerCase();
+                                    if (lower.includes('resend') || lower.includes('back') || lower.includes('cancel')) continue;
+                                    btn.click();
+                                    return text.substring(0, 60);
+                                }
+                                return null;
+                            });
+                            if (lastResort) {
+                                log('INFO', `Clicked button via last resort: "${lastResort}"`, this.accountId);
+                                verifyClicked = true;
+                            }
+                        }
+
                         if (verifyClicked) {
-                            log('INFO', 'Verify button clicked after OTP, waiting for session to establish...', this.accountId);
+                            log('INFO', 'Verify/Continue button clicked after OTP, waiting for session...', this.accountId);
+
+                            // Take debug screenshot after clicking verify
+                            try {
+                                await this.page.screenshot({ path: 'debug_after_verify.png' });
+                                log('INFO', 'Debug screenshot saved: debug_after_verify.png', this.accountId);
+                            } catch (e) {}
 
                             // After confirm-otp → 200, the auth is DONE.
                             // Wait for the page to redirect back to hiring.amazon.ca with a valid session.
@@ -1605,6 +1721,12 @@ class AccountSession {
                             const postOtpUrl = this.page.url();
                             log('INFO', `Post-OTP URL: ${postOtpUrl}`, this.accountId);
 
+                            // Take final screenshot
+                            try {
+                                await this.page.screenshot({ path: 'debug_post_otp_final.png' });
+                                log('INFO', 'Debug screenshot saved: debug_post_otp_final.png', this.accountId);
+                            } catch (e) {}
+
                             // If we're no longer on the auth page, login is complete
                             if (!postOtpUrl.includes('auth.hiring.amazon')) {
                                 log('INFO', 'OTP verified, redirected away from auth page — login successful!', this.accountId);
@@ -1621,11 +1743,19 @@ class AccountSession {
                             this.lastLoginTime = new Date();
                             return true;
                         } else {
-                            log('WARNING', 'No verify button found after OTP', this.accountId);
+                            log('WARNING', 'No verify button found after OTP — check debug_otp_filled.png', this.accountId);
+                            // Take screenshot to debug
+                            try {
+                                await this.page.screenshot({ path: 'debug_no_verify_btn.png' });
+                                log('INFO', 'Debug screenshot saved: debug_no_verify_btn.png', this.accountId);
+                            } catch (e) {}
                         }
 
                     } catch (otpErr) {
-                        log('ERROR', `OTP retrieval failed: ${otpErr.message}`, this.accountId);
+                        log('ERROR', `OTP retrieval/filling failed: ${otpErr.message}`, this.accountId);
+                        try {
+                            await this.page.screenshot({ path: 'debug_otp_error.png' });
+                        } catch (e) {}
                     }
                 } else if (otpFieldFound) {
                     log('WARNING', 'OTP input found but no email_imap config — cannot auto-fill OTP', this.accountId);
@@ -2640,6 +2770,9 @@ process.on('SIGTERM', async () => {
 
 // Main entry point
 async function main() {
+    log('INFO', `========================================`);
+    log('INFO', `Auto-Login Script ${SCRIPT_VERSION}`);
+    log('INFO', `========================================`);
     const manager = new AutoLoginManager();
     await manager.run();
 }
