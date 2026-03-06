@@ -1586,13 +1586,40 @@ class AccountSession {
                         }
 
                         if (verifyClicked) {
-                            log('INFO', 'Verify button clicked after OTP, waiting for response...', this.accountId);
+                            log('INFO', 'Verify button clicked after OTP, waiting for session to establish...', this.accountId);
+
+                            // After confirm-otp → 200, the auth is DONE.
+                            // Wait for the page to redirect back to hiring.amazon.ca with a valid session.
+                            // Do NOT click any more buttons — that could click "Sign In" on the
+                            // redirected page and break the session.
+                            await this.page.waitForTimeout(5000);
+
+                            // Wait for navigation/redirect to complete
+                            try {
+                                await this.page.waitForLoadState('networkidle', { timeout: 10000 });
+                            } catch (e) {}
+
+                            // Wait a bit more for session cookies to propagate
                             await this.page.waitForTimeout(3000);
 
-                            // Wait for any navigation
-                            try {
-                                await this.page.waitForLoadState('networkidle', { timeout: 5000 });
-                            } catch (e) {}
+                            const postOtpUrl = this.page.url();
+                            log('INFO', `Post-OTP URL: ${postOtpUrl}`, this.accountId);
+
+                            // If we're no longer on the auth page, login is complete
+                            if (!postOtpUrl.includes('auth.hiring.amazon')) {
+                                log('INFO', 'OTP verified, redirected away from auth page — login successful!', this.accountId);
+                                this.lastLoginTime = new Date();
+                                return true;
+                            }
+
+                            // If still on auth page, navigate to hiring.amazon.ca to check session
+                            log('INFO', 'Still on auth page, navigating to hiring.amazon.ca to verify session...', this.accountId);
+                            await this.page.goto('https://hiring.amazon.ca/', { waitUntil: 'networkidle', timeout: 30000 });
+                            await this.page.waitForTimeout(3000);
+
+                            log('INFO', `Final URL: ${this.page.url()}`, this.accountId);
+                            this.lastLoginTime = new Date();
+                            return true;
                         } else {
                             log('WARNING', 'No verify button found after OTP', this.accountId);
                         }
