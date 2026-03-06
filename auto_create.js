@@ -649,151 +649,221 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             log('INFO', `Registration form fields: ${JSON.stringify(allInputs)}`, accountNum);
         } catch (e) {}
 
-        // Amazon Hiring registration form fields:
+        // Amazon Hiring registration form fields (from screenshot):
         // - Legal first name * (placeholder: "First name")
         // - Legal middle name * (with "I don't have a middle name" checkbox)
         // - Legal surname * (placeholder: "Surname")
-        // - Preferred first name (optional)
-        // - Email or mobile number
-        // - PIN
-        // - Confirm PIN
+        // - Preferred first name (optional, placeholder: "If provided, this is displayed on your badge")
+        // - Email or mobile number *
+        // - PIN *
+        // - Confirm PIN *
 
-        // Fill fields using multiple selector strategies
-        const fieldMappings = [
-            {
-                name: 'firstName',
-                value: accountData.firstName,
-                selectors: [
-                    '#firstName', 'input[name="firstName"]', 'input[name="first_name"]',
-                    'input[placeholder*="First name" i]', 'input[placeholder*="first" i]',
-                    'input[aria-label*="first name" i]', 'input[data-test-id*="firstName" i]',
-                ]
-            },
-            {
-                name: 'lastName',
-                value: accountData.lastName,
-                selectors: [
-                    '#lastName', '#surname', 'input[name="lastName"]', 'input[name="surname"]',
-                    'input[name="last_name"]', 'input[placeholder*="Surname" i]',
-                    'input[placeholder*="last" i]', 'input[placeholder*="surname" i]',
-                    'input[aria-label*="surname" i]', 'input[aria-label*="last name" i]',
-                    'input[data-test-id*="lastName" i]', 'input[data-test-id*="surname" i]',
-                ]
-            },
-            {
-                name: 'email',
-                value: accountData.email,
-                selectors: [
-                    '#email', '#login', 'input[name="email"]', 'input[name="login EmailId"]',
-                    'input[type="email"]', 'input[placeholder*="email" i]',
-                    'input[placeholder*="Email or mobile" i]',
-                    'input[aria-label*="email" i]', 'input[data-test-id*="email" i]',
-                ]
-            },
-            {
-                name: 'phone',
-                value: accountData.phone,
-                selectors: [
-                    '#phoneNumber', '#phone', 'input[name="phone"]', 'input[name="phoneNumber"]',
-                    'input[name="phone_number"]', 'input[type="tel"]',
-                    'input[placeholder*="phone" i]', 'input[placeholder*="mobile" i]',
-                    'input[aria-label*="phone" i]',
-                ]
-            },
-            {
-                name: 'pin',
-                value: accountData.pin,
-                selectors: [
-                    '#pin', 'input[name="pin"]', 'input[type="password"]:first-of-type',
-                    'input[placeholder*="pin" i]', 'input[placeholder*="password" i]',
-                    'input[aria-label*="pin" i]', 'input[data-test-id*="pin" i]',
-                ]
-            },
-            {
-                name: 'confirmPin',
-                value: accountData.confirmPin || accountData.pin,
-                selectors: [
-                    '#confirmPin', '#confirm-pin', 'input[name="confirmPin"]',
-                    'input[name="confirm_pin"]', 'input[name="confirmPassword"]',
-                    'input[type="password"]:nth-of-type(2)',
-                    'input[placeholder*="confirm" i]', 'input[placeholder*="re-enter" i]',
-                    'input[aria-label*="confirm" i]', 'input[data-test-id*="confirmPin" i]',
-                ]
-            },
-        ];
+        // Use multiple strategies to fill each field:
+        // 1. Playwright getByLabel() — finds by associated label text
+        // 2. Playwright getByPlaceholder() — finds by placeholder
+        // 3. CSS selectors — finds by attributes
+        // 4. JS label proximity — finds input near label text
 
-        for (const { name, value, selectors } of fieldMappings) {
-            if (!value) continue;
-            let filled = false;
-            for (const sel of selectors) {
+        async function fillField(page, fieldName, value, labelTexts, placeholderTexts, cssSelectors, accountNum) {
+            if (!value) return false;
+
+            // Strategy 1: getByLabel
+            for (const label of labelTexts) {
+                try {
+                    const el = page.getByLabel(label, { exact: false });
+                    if (await el.count() > 0 && await el.first().isVisible()) {
+                        await el.first().fill(value);
+                        log('INFO', `Filled ${fieldName} via getByLabel("${label}"): ${fieldName.includes('pin') ? '***' : value}`, accountNum);
+                        await page.waitForTimeout(300);
+                        return true;
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 2: getByPlaceholder
+            for (const ph of placeholderTexts) {
+                try {
+                    const el = page.getByPlaceholder(ph, { exact: false });
+                    if (await el.count() > 0 && await el.first().isVisible()) {
+                        await el.first().fill(value);
+                        log('INFO', `Filled ${fieldName} via getByPlaceholder("${ph}"): ${fieldName.includes('pin') ? '***' : value}`, accountNum);
+                        await page.waitForTimeout(300);
+                        return true;
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 3: CSS selectors
+            for (const sel of cssSelectors) {
                 try {
                     const el = await page.$(sel);
                     if (el && await el.isVisible()) {
                         await el.fill(value);
-                        log('INFO', `Filled ${name}: ${name.includes('pin') || name.includes('Pin') ? '***' : value}`, accountNum);
+                        log('INFO', `Filled ${fieldName} via CSS("${sel}"): ${fieldName.includes('pin') ? '***' : value}`, accountNum);
                         await page.waitForTimeout(300);
-                        filled = true;
-                        break;
+                        return true;
                     }
                 } catch (e) {}
             }
-            if (!filled) {
-                log('WARNING', `Could not find field: ${name}`, accountNum);
-            }
-        }
 
-        // Handle "I don't have a middle name" checkbox (Amazon requires middle name OR this checkbox)
-        try {
-            const noMiddleNameCb = await page.$('input[type="checkbox"]');
-            // Look for checkbox near "middle name" text
-            const middleNameCheckbox = await page.evaluate(() => {
-                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                for (const cb of checkboxes) {
-                    const parent = cb.closest('div, label, span, li');
-                    if (parent) {
-                        const text = parent.textContent.toLowerCase();
-                        if (text.includes('middle name') || text.includes('don\'t have')) {
-                            return { found: true, id: cb.id, name: cb.name };
+            // Strategy 4: Find input near a label containing text (JS-based)
+            for (const label of labelTexts) {
+                try {
+                    const inputInfo = await page.evaluate((labelText) => {
+                        const labels = document.querySelectorAll('label, .label, [class*="label"]');
+                        for (const lbl of labels) {
+                            if (lbl.textContent.toLowerCase().includes(labelText.toLowerCase())) {
+                                // Check for associated input via 'for' attribute
+                                if (lbl.htmlFor) {
+                                    const inp = document.getElementById(lbl.htmlFor);
+                                    if (inp) return { id: inp.id, name: inp.name, found: true };
+                                }
+                                // Check for input inside the label
+                                const inp = lbl.querySelector('input, textarea');
+                                if (inp) return { id: inp.id, name: inp.name, found: true };
+                                // Check sibling/next elements
+                                let next = lbl.nextElementSibling;
+                                while (next) {
+                                    const inp = next.tagName === 'INPUT' ? next : next.querySelector('input, textarea');
+                                    if (inp && inp.offsetParent !== null) return { id: inp.id, name: inp.name, found: true };
+                                    next = next.nextElementSibling;
+                                }
+                                // Check parent container
+                                const parent = lbl.closest('div, fieldset, section');
+                                if (parent) {
+                                    const inp = parent.querySelector('input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])');
+                                    if (inp && inp.offsetParent !== null) return { id: inp.id, name: inp.name, found: true };
+                                }
+                            }
+                        }
+                        return { found: false };
+                    }, label);
+
+                    if (inputInfo.found) {
+                        let sel = inputInfo.id ? `#${inputInfo.id}` : `input[name="${inputInfo.name}"]`;
+                        const el = await page.$(sel);
+                        if (el && await el.isVisible()) {
+                            await el.fill(value);
+                            log('INFO', `Filled ${fieldName} via label proximity("${label}"→${sel}): ${fieldName.includes('pin') ? '***' : value}`, accountNum);
+                            await page.waitForTimeout(300);
+                            return true;
                         }
                     }
-                }
-                return { found: false };
-            });
+                } catch (e) {}
+            }
 
-            if (middleNameCheckbox.found) {
-                let cbSelector = 'input[type="checkbox"]';
-                if (middleNameCheckbox.id) cbSelector = `#${middleNameCheckbox.id}`;
-                else if (middleNameCheckbox.name) cbSelector = `input[name="${middleNameCheckbox.name}"]`;
+            log('WARNING', `Could not find field: ${fieldName}`, accountNum);
+            return false;
+        }
 
-                const cb = await page.$(cbSelector);
-                if (cb && await cb.isVisible() && !(await cb.isChecked())) {
-                    await cb.check();
-                    log('INFO', 'Checked "I don\'t have a middle name" checkbox', accountNum);
-                    await page.waitForTimeout(300);
+        // Fill first name
+        await fillField(page, 'firstName', accountData.firstName,
+            ['Legal first name', 'First name', 'first name'],
+            ['First name', 'first name', 'First Name'],
+            ['#firstName', 'input[name="firstName"]', 'input[name="first_name"]', 'input[data-test-id*="firstName" i]'],
+            accountNum);
+
+        // Check "I don't have a middle name" checkbox
+        try {
+            // Try getByLabel first
+            const cbLabel = page.getByLabel("I don't have a middle name", { exact: false });
+            if (await cbLabel.count() > 0 && await cbLabel.first().isVisible()) {
+                if (!(await cbLabel.first().isChecked())) {
+                    await cbLabel.first().check();
+                    log('INFO', 'Checked "I don\'t have a middle name" via getByLabel', accountNum);
                 }
             } else {
-                log('DEBUG', 'No middle name checkbox found', accountNum);
+                // Try has-text selector
+                const cbText = page.locator('text=middle name').locator('..').locator('input[type="checkbox"]');
+                if (await cbText.count() > 0) {
+                    await cbText.first().check();
+                    log('INFO', 'Checked "I don\'t have a middle name" via text locator', accountNum);
+                } else {
+                    // JS fallback
+                    const checked = await page.evaluate(() => {
+                        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                        for (const cb of checkboxes) {
+                            const parent = cb.closest('div, label, span, li, p');
+                            if (parent && parent.textContent.toLowerCase().includes('middle name')) {
+                                cb.checked = true;
+                                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                                cb.dispatchEvent(new Event('input', { bubbles: true }));
+                                cb.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                    if (checked) {
+                        log('INFO', 'Checked "I don\'t have a middle name" via JS', accountNum);
+                    } else {
+                        log('WARNING', 'Could not find middle name checkbox', accountNum);
+                    }
+                }
             }
+            await page.waitForTimeout(300);
         } catch (e) {
             log('DEBUG', `Middle name checkbox error: ${e.message}`, accountNum);
         }
 
-        // Handle terms/privacy checkboxes (but NOT the middle name one we already handled)
+        // Fill surname
+        await fillField(page, 'lastName', accountData.lastName,
+            ['Legal surname', 'Surname', 'Last name', 'surname'],
+            ['Surname', 'surname', 'Last name', 'last name'],
+            ['#lastName', '#surname', 'input[name="lastName"]', 'input[name="surname"]', 'input[data-test-id*="lastName" i]', 'input[data-test-id*="surname" i]'],
+            accountNum);
+
+        // Fill email
+        await fillField(page, 'email', accountData.email,
+            ['Email or mobile', 'Email', 'email', 'Email address'],
+            ['email', 'Email', 'Email or mobile'],
+            ['#email', '#login', 'input[name="email"]', 'input[type="email"]', 'input[name="login EmailId"]', 'input[data-test-id*="email" i]'],
+            accountNum);
+
+        // Fill phone (might not be on registration form, that's OK)
+        await fillField(page, 'phone', accountData.phone,
+            ['Phone', 'Mobile', 'Phone number', 'phone'],
+            ['Phone', 'phone', 'Mobile', 'mobile'],
+            ['#phoneNumber', '#phone', 'input[name="phone"]', 'input[name="phoneNumber"]', 'input[type="tel"]'],
+            accountNum);
+
+        // Fill PIN
+        await fillField(page, 'pin', accountData.pin,
+            ['PIN', 'Password', 'Create a PIN', 'pin'],
+            ['PIN', 'pin', 'Password', 'password', 'Create a PIN'],
+            ['#pin', 'input[name="pin"]', 'input[type="password"]'],
+            accountNum);
+
+        // Fill confirm PIN
+        await fillField(page, 'confirmPin', accountData.confirmPin || accountData.pin,
+            ['Confirm PIN', 'Confirm password', 'Re-enter PIN', 'confirm'],
+            ['Confirm', 'confirm', 'Re-enter', 're-enter'],
+            ['#confirmPin', '#confirm-pin', 'input[name="confirmPin"]', 'input[name="confirm_pin"]'],
+            accountNum);
+
+        // Handle terms/privacy checkboxes
         try {
-            const checkboxes = await page.$$('input[type="checkbox"]');
-            for (const cb of checkboxes) {
-                if (await cb.isVisible() && !(await cb.isChecked())) {
-                    // Check the label — only check terms/privacy/consent checkboxes
-                    const cbInfo = await page.evaluate(el => {
-                        const parent = el.closest('div, label, span, li');
-                        return parent ? parent.textContent.toLowerCase() : '';
-                    }, cb);
-                    if (cbInfo.includes('terms') || cbInfo.includes('privacy') || cbInfo.includes('agree') || cbInfo.includes('consent')) {
-                        await cb.check();
-                        log('INFO', 'Checked terms/privacy checkbox', accountNum);
+            const checked = await page.evaluate(() => {
+                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                let count = 0;
+                for (const cb of checkboxes) {
+                    if (cb.offsetParent === null || cb.checked) continue;
+                    const parent = cb.closest('div, label, span, li, p');
+                    if (parent) {
+                        const text = parent.textContent.toLowerCase();
+                        // Only check terms/privacy, not middle name
+                        if ((text.includes('terms') || text.includes('privacy') || text.includes('agree') || text.includes('consent'))
+                            && !text.includes('middle name')) {
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', { bubbles: true }));
+                            cb.click();
+                            count++;
+                        }
                     }
                 }
-            }
+                return count;
+            });
+            if (checked > 0) log('INFO', `Checked ${checked} terms/privacy checkbox(es)`, accountNum);
         } catch (e) {}
 
         // Scroll down to make sure submit button is visible
