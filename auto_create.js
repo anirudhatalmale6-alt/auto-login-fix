@@ -573,10 +573,33 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         await clickContinueButton(page, accountNum);
         await page.waitForTimeout(3000);
 
-        // Step 6: Handle CAPTCHA if it appears
+        // Step 5b: Check for "already registered" or other errors — skip if so
+        const alreadyRegistered = await page.evaluate(() => {
+            const pageText = document.body.innerText.toLowerCase();
+            const errorEls = document.querySelectorAll('.error, [role="alert"], .alert-danger, .error-message, [class*="error"], [class*="alert"]');
+            const errorTexts = Array.from(errorEls).map(e => e.textContent.toLowerCase()).join(' ');
+            const allText = pageText + ' ' + errorTexts;
+
+            if (allText.includes('already registered') || allText.includes('already exists') ||
+                allText.includes('already have an account') || allText.includes('account already') ||
+                allText.includes('email already') || allText.includes('already in use') ||
+                allText.includes('duplicate') || allText.includes('already been registered')) {
+                return true;
+            }
+            return false;
+        });
+
+        if (alreadyRegistered) {
+            log('WARNING', `Account already registered: ${accountData.email} — SKIPPING`, accountNum);
+            await context.close();
+            return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
+        }
+
+        // Step 6: Handle CAPTCHA if it appears (CAPTCHA comes after filling details on signup too)
         log('INFO', 'Checking for CAPTCHA...', accountNum);
         const captchaModal = await page.$('#captchaModal');
-        if (captchaModal) {
+        const wafCaptcha = await page.$('awswaf-captcha');
+        if (captchaModal || wafCaptcha) {
             log('INFO', 'CAPTCHA detected, solving...', accountNum);
             const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
             let solved = false;
@@ -593,9 +616,31 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             }
         }
 
-        // Step 7: Click any remaining continue buttons
-        for (let i = 0; i < 3; i++) {
+        // Step 7: Click any remaining continue buttons (multiple rounds)
+        for (let i = 0; i < 5; i++) {
             await page.waitForTimeout(2000);
+
+            // Check again for "already registered" after each step
+            const regError = await page.evaluate(() => {
+                const text = document.body.innerText.toLowerCase();
+                return text.includes('already registered') || text.includes('already exists') ||
+                       text.includes('already have an account') || text.includes('email already');
+            });
+            if (regError) {
+                log('WARNING', `Account already registered (detected at step ${i + 1}): ${accountData.email}`, accountNum);
+                await context.close();
+                return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
+            }
+
+            // Check for another CAPTCHA (can appear again at different steps)
+            const captcha2 = await page.$('#captchaModal');
+            const waf2 = await page.$('awswaf-captcha');
+            if (captcha2 || waf2) {
+                log('INFO', `CAPTCHA appeared again at step ${i + 1}, solving...`, accountNum);
+                await solveCaptcha(page, nopecha, accountNum);
+                await page.waitForTimeout(2000);
+            }
+
             const clicked = await clickContinueButton(page, accountNum);
             if (!clicked) break;
             log('INFO', `Post-submit continue button ${i + 1} clicked`, accountNum);
@@ -695,6 +740,13 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
 
 /**
  * Generate account data from config.
+ *
+ * Two modes:
+ * 1. Static email/phone: Same email and phone for ALL accounts (client uses email forwarding).
+ *    Uses email_template with {} replaced by index, OR explicit emails list.
+ * 2. Explicit list: Provide a list of emails to register.
+ *
+ * The email and phone are "static" (same forwarding inbox receives all OTPs).
  */
 function generateAccounts(config) {
     const accounts = [];
@@ -703,6 +755,7 @@ function generateAccounts(config) {
     const pin = config.create.default_pin || '112233';
     const firstName = config.create.first_name || 'John';
     const lastName = config.create.last_name || 'Doe';
+    const phone = config.create.phone || ''; // Static phone number for all accounts
     const startIndex = config.create.start_index || 1;
 
     if (config.create.emails && Array.isArray(config.create.emails)) {
@@ -714,10 +767,11 @@ function generateAccounts(config) {
                 confirmPin: pin,
                 firstName: firstName,
                 lastName: lastName,
+                phone: phone,
             });
         }
     } else if (emailTemplate) {
-        // Generate from template
+        // Generate from template — e.g., "kush+{}@gmail.com" → kush+1@gmail.com, kush+2@gmail.com, etc.
         for (let i = startIndex; i < startIndex + count; i++) {
             accounts.push({
                 email: emailTemplate.replace('{}', i),
@@ -725,6 +779,7 @@ function generateAccounts(config) {
                 confirmPin: pin,
                 firstName: firstName,
                 lastName: lastName,
+                phone: phone,
             });
         }
     }
@@ -743,10 +798,11 @@ async function main() {
         const exampleConfig = {
             create: {
                 count: 100,
-                email_template: "user{}@gmail.com",
+                email_template: "youremail+{}@gmail.com",
                 default_pin: "112233",
                 first_name: "John",
                 last_name: "Doe",
+                phone: "+1234567890",
                 start_index: 1,
                 emails: null
             },

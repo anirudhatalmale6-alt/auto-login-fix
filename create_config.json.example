@@ -5,6 +5,7 @@
     "default_pin": "112233",
     "first_name": "John",
     "last_name": "Doe",
+    "phone": "+1234567890",
     "start_index": 1,
     "emails": null
   },
