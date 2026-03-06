@@ -1515,14 +1515,90 @@ class AccountSession {
                         if (otpInput) {
                             await otpInput.fill(otp);
                             log('INFO', 'OTP filled into input field', this.accountId);
-                            await this.page.waitForTimeout(500);
+                            await this.page.waitForTimeout(1000);
                         }
 
-                        // Click verify/continue after OTP
-                        // (will be handled by the button-clicking code below)
+                        // Click Verify button immediately after OTP
+                        log('INFO', 'Looking for Verify button after OTP...', this.accountId);
+                        let verifyClicked = false;
+
+                        // Try specific verify button selectors
+                        const verifySelectors = [
+                            'button:has-text("Verify")',
+                            'button:has-text("verify")',
+                            'button[data-test-id*="verify" i]',
+                            'button[aria-label*="verify" i]',
+                            'button:has-text("Submit")',
+                            'button:has-text("Confirm")',
+                        ];
+
+                        for (const sel of verifySelectors) {
+                            try {
+                                const btn = await this.page.$(sel);
+                                if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                                    const btnText = await btn.textContent().catch(() => '');
+                                    log('INFO', `Clicking verify button: "${btnText.trim()}" (${sel})`, this.accountId);
+                                    try {
+                                        await btn.click({ timeout: 5000 });
+                                    } catch (e) {
+                                        await btn.click({ force: true, timeout: 5000 });
+                                    }
+                                    verifyClicked = true;
+                                    break;
+                                }
+                            } catch (e) {}
+                        }
+
+                        // Fallback: JS click on any button with verify/submit text
+                        if (!verifyClicked) {
+                            const jsClicked = await this.page.evaluate(() => {
+                                const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                                for (const btn of buttons) {
+                                    if (btn.offsetParent === null || btn.disabled) continue;
+                                    const text = (btn.textContent || btn.value || '').toLowerCase();
+                                    if (text.includes('verify') || text.includes('submit') || text.includes('confirm')) {
+                                        btn.click();
+                                        return (btn.textContent || btn.value || '').trim().substring(0, 60);
+                                    }
+                                }
+                                return null;
+                            });
+                            if (jsClicked) {
+                                log('INFO', `Clicked verify button via JS: "${jsClicked}"`, this.accountId);
+                                verifyClicked = true;
+                            }
+                        }
+
+                        // Fallback: click StencilReactButton (Amazon's standard button)
+                        if (!verifyClicked) {
+                            try {
+                                const stencilBtns = await this.page.$$('button[data-test-component="StencilReactButton"]');
+                                for (const btn of stencilBtns) {
+                                    if (await btn.isVisible() && await btn.isEnabled()) {
+                                        const text = await btn.textContent().catch(() => '');
+                                        log('INFO', `Clicking StencilReactButton as verify: "${text.trim()}"`, this.accountId);
+                                        await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true }));
+                                        verifyClicked = true;
+                                        break;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+
+                        if (verifyClicked) {
+                            log('INFO', 'Verify button clicked after OTP, waiting for response...', this.accountId);
+                            await this.page.waitForTimeout(3000);
+
+                            // Wait for any navigation
+                            try {
+                                await this.page.waitForLoadState('networkidle', { timeout: 5000 });
+                            } catch (e) {}
+                        } else {
+                            log('WARNING', 'No verify button found after OTP', this.accountId);
+                        }
+
                     } catch (otpErr) {
                         log('ERROR', `OTP retrieval failed: ${otpErr.message}`, this.accountId);
-                        // Continue anyway — maybe the user will enter it manually
                     }
                 } else if (otpFieldFound) {
                     log('WARNING', 'OTP input found but no email_imap config — cannot auto-fill OTP', this.accountId);
