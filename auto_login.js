@@ -1454,83 +1454,172 @@ class AccountSession {
         }
 
         try {
-            // Step 1: Wait for <audio> element to appear with base64 data
-            log('INFO', 'Waiting for audio element with base64 data...', this.accountId);
+            // AWS WAF CAPTCHA uses <awswaf-captcha> custom element with Shadow DOM.
+            // All internal elements (audio, input, buttons) are inside the shadow root.
+            // We must pierce the Shadow DOM to access them.
+
+            // Step 1: Wait for the shadow root to be available and find audio
+            log('INFO', 'Waiting for awswaf-captcha shadow DOM and audio data...', this.accountId);
 
             let audioData = null;
             const startTime = Date.now();
 
-            while (Date.now() - startTime < 15000) {
+            while (Date.now() - startTime < 20000) {
                 audioData = await this.page.evaluate(() => {
-                    // Check for audio elements anywhere on the page
-                    const audioElements = document.querySelectorAll('audio');
-                    for (const audio of audioElements) {
-                        const src = audio.src || audio.currentSrc;
-                        if (src && src.startsWith('data:audio')) {
-                            // Extract base64 part after the mime type prefix
-                            const base64Match = src.match(/^data:audio\/[^;]+;base64,(.+)$/);
-                            if (base64Match) return base64Match[1];
-                        }
-                        // Also check <source> children
-                        const sources = audio.querySelectorAll('source');
-                        for (const source of sources) {
-                            if (source.src && source.src.startsWith('data:audio')) {
-                                const base64Match = source.src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                    // Helper: recursively search through shadow roots for audio elements
+                    function findAudioInShadow(root) {
+                        // Check direct audio elements
+                        const audioElements = root.querySelectorAll('audio');
+                        for (const audio of audioElements) {
+                            const src = audio.src || audio.currentSrc;
+                            if (src && src.startsWith('data:audio')) {
+                                const base64Match = src.match(/^data:audio\/[^;]+;base64,(.+)$/);
                                 if (base64Match) return base64Match[1];
+                            }
+                            // Check <source> children
+                            const sources = audio.querySelectorAll('source');
+                            for (const source of sources) {
+                                if (source.src && source.src.startsWith('data:audio')) {
+                                    const base64Match = source.src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                                    if (base64Match) return base64Match[1];
+                                }
+                            }
+                        }
+
+                        // Recurse into shadow roots of child elements
+                        const allElements = root.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.shadowRoot) {
+                                const result = findAudioInShadow(el.shadowRoot);
+                                if (result) return result;
+                            }
+                        }
+                        return null;
+                    }
+
+                    // Start from document and <awswaf-captcha> elements
+                    // First try the awswaf-captcha element directly
+                    const wafCaptcha = document.querySelector('awswaf-captcha');
+                    if (wafCaptcha && wafCaptcha.shadowRoot) {
+                        const result = findAudioInShadow(wafCaptcha.shadowRoot);
+                        if (result) return result;
+                    }
+
+                    // Also search in #captchaModal and its children
+                    const modal = document.querySelector('#captchaModal');
+                    if (modal) {
+                        const allElsInModal = modal.querySelectorAll('*');
+                        for (const el of allElsInModal) {
+                            if (el.shadowRoot) {
+                                const result = findAudioInShadow(el.shadowRoot);
+                                if (result) return result;
                             }
                         }
                     }
-                    return null;
+
+                    // Fallback: search entire document
+                    return findAudioInShadow(document);
                 });
 
                 if (audioData) {
-                    log('INFO', `Audio data extracted (${audioData.length} chars base64)`, this.accountId);
+                    log('INFO', `Audio data extracted from Shadow DOM (${audioData.length} chars base64)`, this.accountId);
                     break;
                 }
                 await this.page.waitForTimeout(500);
             }
 
+            // If still no audio, try clicking the audio/play button inside the shadow DOM
             if (!audioData) {
-                // Try alternative: intercept audio from network requests
-                log('WARNING', 'No base64 audio element found, checking for audio URL...', this.accountId);
+                log('WARNING', 'No audio data yet, trying to click play button inside shadow DOM...', this.accountId);
 
-                // Look for any audio source URL
-                const audioUrl = await this.page.evaluate(() => {
-                    const audioElements = document.querySelectorAll('audio');
-                    for (const audio of audioElements) {
-                        const src = audio.src || audio.currentSrc;
-                        if (src && !src.startsWith('data:') && src.length > 0) return src;
-                        const sources = audio.querySelectorAll('source');
-                        for (const source of sources) {
-                            if (source.src && !source.src.startsWith('data:')) return source.src;
+                const clicked = await this.page.evaluate(() => {
+                    function findAndClickInShadow(root) {
+                        // Look for play/audio buttons
+                        const buttons = root.querySelectorAll('button, [role="button"], [aria-label*="play" i], [aria-label*="audio" i], [aria-label*="listen" i]');
+                        for (const btn of buttons) {
+                            const text = (btn.textContent || '').toLowerCase();
+                            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            if (text.includes('play') || text.includes('audio') || text.includes('listen') ||
+                                ariaLabel.includes('play') || ariaLabel.includes('audio') || ariaLabel.includes('listen')) {
+                                btn.click();
+                                return true;
+                            }
                         }
+                        // Recurse into shadow roots
+                        const allElements = root.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.shadowRoot) {
+                                const result = findAndClickInShadow(el.shadowRoot);
+                                if (result) return result;
+                            }
+                        }
+                        return false;
                     }
-                    return null;
+
+                    const wafCaptcha = document.querySelector('awswaf-captcha');
+                    if (wafCaptcha && wafCaptcha.shadowRoot) {
+                        return findAndClickInShadow(wafCaptcha.shadowRoot);
+                    }
+                    return false;
                 });
 
-                if (audioUrl) {
-                    log('INFO', `Found audio URL: ${audioUrl}`, this.accountId);
-                    // Download and convert to base64
-                    try {
-                        const response = await this.page.context().request.get(audioUrl);
-                        const buffer = await response.body();
-                        audioData = buffer.toString('base64');
-                        log('INFO', `Downloaded audio (${audioData.length} chars base64)`, this.accountId);
-                    } catch (dlError) {
-                        log('ERROR', `Failed to download audio: ${dlError.message}`, this.accountId);
+                if (clicked) {
+                    log('INFO', 'Clicked play button inside shadow DOM, waiting for audio...', this.accountId);
+                    await this.page.waitForTimeout(3000);
+
+                    // Try extracting audio again
+                    audioData = await this.page.evaluate(() => {
+                        function findAudioInShadow(root) {
+                            const audioElements = root.querySelectorAll('audio');
+                            for (const audio of audioElements) {
+                                const src = audio.src || audio.currentSrc;
+                                if (src && src.startsWith('data:audio')) {
+                                    const match = src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                                    if (match) return match[1];
+                                }
+                            }
+                            const allElements = root.querySelectorAll('*');
+                            for (const el of allElements) {
+                                if (el.shadowRoot) {
+                                    const result = findAudioInShadow(el.shadowRoot);
+                                    if (result) return result;
+                                }
+                            }
+                            return null;
+                        }
+                        const wafCaptcha = document.querySelector('awswaf-captcha');
+                        if (wafCaptcha && wafCaptcha.shadowRoot) {
+                            return findAudioInShadow(wafCaptcha.shadowRoot);
+                        }
+                        return findAudioInShadow(document);
+                    });
+
+                    if (audioData) {
+                        log('INFO', `Audio data extracted after play click (${audioData.length} chars base64)`, this.accountId);
                     }
                 }
             }
 
             if (!audioData) {
-                log('ERROR', 'Could not extract audio data from CAPTCHA', this.accountId);
+                log('ERROR', 'Could not extract audio data from CAPTCHA Shadow DOM', this.accountId);
 
-                // Dump DOM for debugging
-                const captchaHTML = await this.page.evaluate(() => {
-                    const modal = document.querySelector('#captchaModal');
-                    return modal ? modal.innerHTML.substring(0, 2000) : 'modal not found';
+                // Debug: dump what's in the shadow root
+                const debugInfo = await this.page.evaluate(() => {
+                    const wafCaptcha = document.querySelector('awswaf-captcha');
+                    if (!wafCaptcha) return 'awswaf-captcha element not found';
+                    if (!wafCaptcha.shadowRoot) return 'awswaf-captcha has no shadow root (closed)';
+
+                    const sr = wafCaptcha.shadowRoot;
+                    const info = {
+                        childCount: sr.children.length,
+                        innerHTML: sr.innerHTML.substring(0, 3000),
+                        audioCount: sr.querySelectorAll('audio').length,
+                        inputCount: sr.querySelectorAll('input').length,
+                        buttonCount: sr.querySelectorAll('button').length,
+                    };
+                    return JSON.stringify(info);
                 });
-                log('DEBUG', `Captcha modal HTML (first 2000 chars): ${captchaHTML}`, this.accountId);
+                log('DEBUG', `Shadow DOM debug: ${debugInfo}`, this.accountId);
                 return false;
             }
 
@@ -1556,62 +1645,79 @@ class AccountSession {
                 return false;
             }
 
-            // Step 3: Find the input field and type the answer
-            log('INFO', 'Typing CAPTCHA answer into input field...', this.accountId);
+            // Step 3: Find the input field inside shadow DOM and type the answer
+            log('INFO', 'Typing CAPTCHA answer into input field (Shadow DOM)...', this.accountId);
 
             const inputTyped = await this.page.evaluate((answer) => {
-                // Look for text input inside captcha modal
-                const modal = document.querySelector('#captchaModal');
-                const searchRoots = modal ? [modal, document] : [document];
-
-                for (const root of searchRoots) {
-                    // Try various input selectors
+                function findInputInShadow(root) {
                     const selectors = [
                         'input[type="text"]',
-                        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                        'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"])',
                         'input[placeholder]',
-                        'input[aria-label*="captcha" i]',
-                        'input[aria-label*="answer" i]',
-                        'input[aria-label*="type" i]',
-                        '#captcha-guess-input',
-                        '#captchaGuess',
                     ];
-
                     for (const sel of selectors) {
-                        const input = root.querySelector(sel);
-                        if (input && input.offsetParent !== null) {
-                            // Clear and set value
+                        const inputs = root.querySelectorAll(sel);
+                        for (const input of inputs) {
+                            // Set value using native setter to trigger framework events
                             input.value = '';
                             input.focus();
-                            // Use native input setter to trigger React/framework events
                             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                             nativeInputValueSetter.call(input, answer);
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                            return { success: true, selector: sel, id: input.id };
+                            input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                            input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true }));
+                            return { success: true, id: input.id, placeholder: input.placeholder };
+                        }
+                    }
+                    // Recurse into nested shadow roots
+                    const allElements = root.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.shadowRoot) {
+                            const result = findInputInShadow(el.shadowRoot);
+                            if (result) return result;
+                        }
+                    }
+                    return null;
+                }
+
+                // Search in awswaf-captcha shadow root first
+                const wafCaptcha = document.querySelector('awswaf-captcha');
+                if (wafCaptcha && wafCaptcha.shadowRoot) {
+                    const result = findInputInShadow(wafCaptcha.shadowRoot);
+                    if (result) return result;
+                }
+
+                // Fallback: search regular DOM too
+                const modal = document.querySelector('#captchaModal');
+                if (modal) {
+                    const allEls = modal.querySelectorAll('*');
+                    for (const el of allEls) {
+                        if (el.shadowRoot) {
+                            const result = findInputInShadow(el.shadowRoot);
+                            if (result) return result;
                         }
                     }
                 }
+
                 return { success: false };
             }, answer);
 
-            if (!inputTyped.success) {
-                log('WARNING', 'Could not find input via evaluate, trying Playwright fill...', this.accountId);
-                // Fallback: try Playwright's fill method with various selectors
-                const inputSelectors = [
-                    '#captchaModal input[type="text"]',
-                    '#captchaModal input:not([type="hidden"])',
-                    '#captcha-guess-input',
-                    '#captchaGuess',
-                    'input[type="text"]',
+            if (!inputTyped || !inputTyped.success) {
+                log('WARNING', 'Could not find input in Shadow DOM, trying Playwright piercing selector...', this.accountId);
+                // Playwright can pierce shadow DOM with >> syntax
+                const piercingSelectors = [
+                    'awswaf-captcha >> input[type="text"]',
+                    'awswaf-captcha >> input',
+                    '#captchaForm >> input[type="text"]',
+                    '#captchaForm >> input',
                 ];
                 let filled = false;
-                for (const sel of inputSelectors) {
+                for (const sel of piercingSelectors) {
                     try {
                         const input = await this.page.$(sel);
-                        if (input && await input.isVisible()) {
+                        if (input) {
                             await input.fill(answer);
-                            log('INFO', `Typed answer using Playwright fill (${sel})`, this.accountId);
+                            log('INFO', `Typed answer using Playwright piercing selector (${sel})`, this.accountId);
                             filled = true;
                             break;
                         }
@@ -1620,71 +1726,96 @@ class AccountSession {
                     }
                 }
                 if (!filled) {
-                    log('ERROR', 'Could not find CAPTCHA input field to type answer', this.accountId);
+                    log('ERROR', 'Could not find CAPTCHA input field in Shadow DOM', this.accountId);
                     return false;
                 }
             } else {
-                log('INFO', `Typed answer into input (selector: ${inputTyped.selector}, id: ${inputTyped.id})`, this.accountId);
+                log('INFO', `Typed answer into Shadow DOM input (id: ${inputTyped.id}, placeholder: ${inputTyped.placeholder})`, this.accountId);
             }
 
             await this.page.waitForTimeout(500);
 
-            // Step 4: Click the CAPTCHA verify/submit button
-            log('INFO', 'Looking for CAPTCHA verify/submit button...', this.accountId);
+            // Step 4: Click the CAPTCHA verify/submit button inside shadow DOM
+            log('INFO', 'Looking for CAPTCHA submit button in Shadow DOM...', this.accountId);
 
             const captchaSubmitted = await this.page.evaluate(() => {
-                const modal = document.querySelector('#captchaModal');
-                const searchRoots = modal ? [modal, document] : [document];
-
-                for (const root of searchRoots) {
-                    const selectors = [
-                        'button[type="submit"]',
-                        'button:not([id="amzn-btn-audio-internal"])',
-                        '[role="button"]',
-                    ];
-
-                    for (const sel of selectors) {
-                        const buttons = root.querySelectorAll(sel);
-                        for (const btn of buttons) {
-                            const text = (btn.textContent || '').toLowerCase().trim();
-                            const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-                            // Look for submit/verify/confirm buttons
-                            if ((text.includes('submit') || text.includes('verify') || text.includes('confirm') ||
-                                 text.includes('continue') || text.includes('enter') ||
-                                 ariaLabel.includes('submit') || ariaLabel.includes('verify')) &&
-                                btn.offsetParent !== null) {
-                                btn.click();
-                                return { success: true, text: text.substring(0, 50) };
-                            }
+                function findSubmitInShadow(root) {
+                    const buttons = root.querySelectorAll('button, [role="button"]');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || '').toLowerCase().trim();
+                        const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+                        if (text.includes('submit') || text.includes('verify') || text.includes('confirm') ||
+                            ariaLabel.includes('submit') || ariaLabel.includes('verify') || ariaLabel.includes('confirm')) {
+                            btn.click();
+                            return { success: true, text: text.substring(0, 50) };
                         }
                     }
+                    // Recurse into nested shadow roots
+                    const allElements = root.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.shadowRoot) {
+                            const result = findSubmitInShadow(el.shadowRoot);
+                            if (result) return result;
+                        }
+                    }
+                    return null;
+                }
+
+                const wafCaptcha = document.querySelector('awswaf-captcha');
+                if (wafCaptcha && wafCaptcha.shadowRoot) {
+                    const result = findSubmitInShadow(wafCaptcha.shadowRoot);
+                    if (result) return result;
                 }
                 return { success: false };
             });
 
-            if (!captchaSubmitted.success) {
-                log('WARNING', 'Could not find CAPTCHA submit button via text, trying alternative methods...', this.accountId);
-                // Try pressing Enter as fallback
-                try {
-                    await this.page.keyboard.press('Enter');
-                    log('INFO', 'Pressed Enter to submit CAPTCHA', this.accountId);
-                } catch (e) {
-                    log('WARNING', `Enter key failed: ${e.message}`, this.accountId);
+            if (!captchaSubmitted || !captchaSubmitted.success) {
+                log('WARNING', 'Could not find CAPTCHA submit in Shadow DOM, trying piercing selectors...', this.accountId);
+                // Try Playwright piercing selectors
+                const submitSelectors = [
+                    'awswaf-captcha >> button[type="submit"]',
+                    'awswaf-captcha >> button:has-text("Submit")',
+                    'awswaf-captcha >> button:has-text("Verify")',
+                    'awswaf-captcha >> button',
+                ];
+                let clicked = false;
+                for (const sel of submitSelectors) {
+                    try {
+                        const btn = await this.page.$(sel);
+                        if (btn) {
+                            await btn.click({ force: true });
+                            log('INFO', `Clicked CAPTCHA submit via piercing selector (${sel})`, this.accountId);
+                            clicked = true;
+                            break;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                if (!clicked) {
+                    // Last resort: press Enter
+                    try {
+                        await this.page.keyboard.press('Enter');
+                        log('INFO', 'Pressed Enter to submit CAPTCHA', this.accountId);
+                    } catch (e) {
+                        log('WARNING', `Enter key failed: ${e.message}`, this.accountId);
+                    }
                 }
             } else {
-                log('INFO', `CAPTCHA submit button clicked (text: "${captchaSubmitted.text}")`, this.accountId);
+                log('INFO', `CAPTCHA submit clicked in Shadow DOM (text: "${captchaSubmitted.text}")`, this.accountId);
             }
 
             // Step 5: Wait for CAPTCHA to be verified
             log('INFO', 'Waiting for CAPTCHA verification...', this.accountId);
-            await this.page.waitForTimeout(3000);
+            await this.page.waitForTimeout(5000);
 
             // Check if CAPTCHA overlay is gone (indicating success)
             const overlayGone = await this.page.evaluate(() => {
                 const overlay = document.querySelector('#captchaModalOverlay');
                 if (!overlay) return true;
                 const style = window.getComputedStyle(overlay);
-                return style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none';
+                return style.display === 'none' || style.visibility === 'hidden' ||
+                       style.pointerEvents === 'none' || style.opacity === '0';
             });
 
             if (overlayGone) {
@@ -1692,10 +1823,12 @@ class AccountSession {
                 return true;
             }
 
-            // Check if modal is still visible (CAPTCHA might have failed)
+            // Check if modal is still visible
             const modalStillVisible = await this.page.evaluate(() => {
                 const modal = document.querySelector('#captchaModal');
-                return modal && modal.offsetParent !== null;
+                if (!modal) return false;
+                const style = window.getComputedStyle(modal);
+                return style.display !== 'none' && style.visibility !== 'hidden';
             });
 
             if (!modalStillVisible) {
