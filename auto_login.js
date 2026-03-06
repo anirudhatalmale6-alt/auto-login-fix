@@ -1960,19 +1960,33 @@ class AccountSession {
             }
 
             log('INFO', 'Starting runCycle', this.accountId);
-            const isLoggedIn = await this.checkLoggedIn();
-            log('INFO', `Login status check: ${isLoggedIn}`, this.accountId);
 
-            if (!isLoggedIn) {
-                log('INFO', 'Not logged in, performing login...', this.accountId);
-                const result = await this.login();
-                log('INFO', `Login result: ${result}`, this.accountId);
-                return result;
-            } else {
-                log('INFO', 'Already logged in, refreshing session...', this.accountId);
-                await this.page.reload({ waitUntil: 'networkidle' });
-                return true;
+            // Amazon hiring tokens expire after ~2 hours.
+            // Always perform a full re-login to get a fresh token/session.
+            // This keeps the account continuously logged in.
+            const timeSinceLogin = this.lastLoginTime
+                ? (Date.now() - this.lastLoginTime.getTime()) / 1000 / 60
+                : Infinity;
+
+            log('INFO', `Time since last login: ${timeSinceLogin.toFixed(1)} minutes`, this.accountId);
+
+            // If we logged in recently (< 30 min), just reload to keep session alive
+            if (timeSinceLogin < 30) {
+                log('INFO', 'Recent login, doing a page reload to keep session alive...', this.accountId);
+                try {
+                    await this.page.reload({ waitUntil: 'networkidle', timeout: 15000 });
+                    log('INFO', 'Page reloaded successfully', this.accountId);
+                    return true;
+                } catch (e) {
+                    log('WARNING', `Reload failed: ${e.message}, will re-login`, this.accountId);
+                }
             }
+
+            // Full re-login to refresh the token before it expires
+            log('INFO', 'Performing full re-login to refresh session token...', this.accountId);
+            const result = await this.login();
+            log('INFO', `Login result: ${result}`, this.accountId);
+            return result;
         } catch (error) {
             log('ERROR', `Cycle error: ${error.message}`, this.accountId);
             log('ERROR', `Stack trace: ${error.stack}`, this.accountId);
@@ -2272,8 +2286,8 @@ class AutoLoginManager {
 
             log('INFO', 'Starting multi-account auto-login service');
             log('INFO', `Managing ${this.accounts.length} accounts`);
-            log('INFO', `Will run for ${this.config.timing.max_runtime_hours} hours`);
-            log('INFO', `Login interval: ${this.config.timing.login_interval_hours} hours`);
+            log('INFO', `Max runtime: ${this.config.timing.max_runtime_hours === 0 ? 'UNLIMITED (until you close)' : this.config.timing.max_runtime_hours + ' hours'}`);
+            log('INFO', `Re-login interval: ${this.config.timing.login_interval_hours} hours (Amazon tokens expire at 2h)`);
             log('INFO', `Concurrent limit: ${this.concurrentLimit} accounts per batch`);
 
             // Initial login for all accounts
@@ -2287,10 +2301,13 @@ class AutoLoginManager {
                     break;
                 }
 
-                const runtime = Date.now() - this.startTime.getTime();
-                if (runtime >= this.maxRuntime) {
-                    log('INFO', 'Maximum runtime reached (24 hours), stopping...');
-                    break;
+                // max_runtime_hours: 0 means run forever (until user closes)
+                if (this.maxRuntime > 0) {
+                    const runtime = Date.now() - this.startTime.getTime();
+                    if (runtime >= this.maxRuntime) {
+                        log('INFO', `Maximum runtime reached (${this.config.timing.max_runtime_hours}h), stopping...`);
+                        break;
+                    }
                 }
 
                 const waitTime = nextLoginTime.getTime() - Date.now();

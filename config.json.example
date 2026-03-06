@@ -21,8 +21,8 @@
     "logged_in_indicator": ".user-menu, [data-testid='user-menu']"
   },
   "timing": {
-    "login_interval_hours": 2,
-    "max_runtime_hours": 24,
+    "login_interval_hours": 1.5,
+    "max_runtime_hours": 0,
     "page_load_timeout": 30000,
     "action_delay": 1000,
     "concurrent_limit": 10
