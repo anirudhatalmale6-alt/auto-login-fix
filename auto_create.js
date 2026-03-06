@@ -541,17 +541,75 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
 
         log('INFO', `Current URL: ${page.url()}`, accountNum);
 
+        // The registration page is a SPA — may redirect or take time to render.
+        // Wait for the form to actually appear before filling it.
+        log('INFO', 'Waiting for registration form to load...', accountNum);
+
+        // If URL is hiring.amazon.ca/app#/registration, it may redirect to auth.hiring.amazon.com
+        // Wait for either a redirect or form inputs to appear
+        let formReady = false;
+        for (let waitRound = 1; waitRound <= 10; waitRound++) {
+            const curUrl = page.url();
+            log('DEBUG', `Form wait round ${waitRound}/10, URL: ${curUrl}`, accountNum);
+
+            // Check if we've been redirected to auth page
+            if (curUrl.includes('auth.hiring.amazon')) {
+                log('INFO', `Redirected to auth page: ${curUrl}`, accountNum);
+                // Wait for form to render on auth page
+                try {
+                    await page.waitForSelector('input', { timeout: 10000, state: 'visible' });
+                    formReady = true;
+                    break;
+                } catch (e) {
+                    log('DEBUG', 'No inputs on auth page yet, waiting...', accountNum);
+                }
+            }
+
+            // Check for visible input fields
+            const inputCount = await page.evaluate(() => {
+                return document.querySelectorAll('input').length;
+            });
+            const visibleInputCount = await page.evaluate(() => {
+                return Array.from(document.querySelectorAll('input')).filter(el => el.offsetParent !== null).length;
+            });
+
+            log('DEBUG', `Inputs: ${inputCount} total, ${visibleInputCount} visible`, accountNum);
+
+            if (visibleInputCount >= 3) {
+                formReady = true;
+                log('INFO', `Registration form loaded with ${visibleInputCount} visible fields`, accountNum);
+                break;
+            }
+
+            await page.waitForTimeout(2000);
+        }
+
+        if (!formReady) {
+            log('WARNING', 'Registration form did not load within timeout', accountNum);
+            try {
+                await page.screenshot({ path: 'debug_form_not_loaded.png' });
+                log('INFO', 'Debug screenshot: debug_form_not_loaded.png', accountNum);
+            } catch (e) {}
+        }
+
         // Step 4: Fill in registration form
         log('INFO', 'Filling registration form...', accountNum);
 
-        // Dismiss cookie consent on registration page too
+        // Dismiss cookie consent on registration page
         try {
-            const consentBtn = await page.$('button:has-text("I consent"), button:has-text("Accept")');
-            if (consentBtn && await consentBtn.isVisible()) {
-                await consentBtn.click();
-                log('INFO', 'Dismissed cookie consent on registration page', accountNum);
-                await page.waitForTimeout(500);
-            }
+            // Use JS click to handle cookie consent — avoid it being picked as submit button
+            await page.evaluate(() => {
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (text === 'i consent' || text === 'accept' || text === 'accept all') {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            });
+            await page.waitForTimeout(500);
         } catch (e) {}
 
         // Take screenshot of registration form for debugging
@@ -780,15 +838,17 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             } catch (e) {}
         }
 
-        // Fallback: StencilReactButton (but only the LAST one — skip navigation buttons)
+        // Fallback: StencilReactButton (skip cookie consent and navigation buttons)
         if (!submitClicked) {
             try {
                 const stencilBtns = await page.$$('button[data-test-component="StencilReactButton"]');
-                // Click the last visible enabled one (submit buttons are usually at the bottom)
+                // Click the last visible enabled one that's not cookie consent
                 for (let i = stencilBtns.length - 1; i >= 0; i--) {
                     if (await stencilBtns[i].isVisible() && await stencilBtns[i].isEnabled()) {
-                        const text = await stencilBtns[i].textContent().catch(() => '');
-                        log('INFO', `Clicking StencilReactButton (bottom): "${text.trim()}"`, accountNum);
+                        const text = (await stencilBtns[i].textContent().catch(() => '')).trim().toLowerCase();
+                        // Skip cookie consent and navigation buttons
+                        if (text.includes('consent') || text.includes('accept') || text === '' || text.includes('sign in') || text.includes('log in')) continue;
+                        log('INFO', `Clicking StencilReactButton: "${text}"`, accountNum);
                         await stencilBtns[i].click({ timeout: 5000 });
                         submitClicked = true;
                         break;
