@@ -545,43 +545,57 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         // Wait for the form to actually appear before filling it.
         log('INFO', 'Waiting for registration form to load...', accountNum);
 
-        // If URL is hiring.amazon.ca/app#/registration, it may redirect to auth.hiring.amazon.com
-        // Wait for either a redirect or form inputs to appear
+        // The page redirects from hiring.amazon.ca to auth.hiring.amazon.com
+        // Wait for that redirect to complete first, then wait for form to render
+        try {
+            // Wait for URL to change to auth page or for page to settle
+            await page.waitForURL('**/auth.hiring.amazon*', { timeout: 15000 }).catch(() => {});
+            log('INFO', `After redirect, URL: ${page.url()}`, accountNum);
+        } catch (e) {
+            log('DEBUG', `URL wait: ${e.message}`, accountNum);
+        }
+
+        // Wait for page to finish loading after redirect
+        try {
+            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        } catch (e) {}
+        await page.waitForTimeout(2000);
+
+        // Now wait for form inputs to appear
         let formReady = false;
         for (let waitRound = 1; waitRound <= 10; waitRound++) {
-            const curUrl = page.url();
-            log('DEBUG', `Form wait round ${waitRound}/10, URL: ${curUrl}`, accountNum);
+            try {
+                const curUrl = page.url();
+                log('DEBUG', `Form wait round ${waitRound}/10, URL: ${curUrl}`, accountNum);
 
-            // Check if we've been redirected to auth page
-            if (curUrl.includes('auth.hiring.amazon')) {
-                log('INFO', `Redirected to auth page: ${curUrl}`, accountNum);
-                // Wait for form to render on auth page
+                // Wait for at least one visible input
                 try {
-                    await page.waitForSelector('input', { timeout: 10000, state: 'visible' });
-                    formReady = true;
-                    break;
+                    await page.waitForSelector('input', { timeout: 5000, state: 'visible' });
                 } catch (e) {
-                    log('DEBUG', 'No inputs on auth page yet, waiting...', accountNum);
+                    log('DEBUG', 'No visible inputs yet...', accountNum);
+                    await page.waitForTimeout(2000);
+                    continue;
                 }
+
+                // Count visible inputs
+                const visibleInputCount = await page.evaluate(() => {
+                    return Array.from(document.querySelectorAll('input')).filter(el => el.offsetParent !== null).length;
+                });
+
+                log('DEBUG', `Visible inputs: ${visibleInputCount}`, accountNum);
+
+                if (visibleInputCount >= 3) {
+                    formReady = true;
+                    log('INFO', `Registration form loaded with ${visibleInputCount} visible fields`, accountNum);
+                    break;
+                }
+
+                await page.waitForTimeout(2000);
+            } catch (e) {
+                // Execution context destroyed — page is still navigating
+                log('DEBUG', `Form wait error (round ${waitRound}): ${e.message.substring(0, 80)}`, accountNum);
+                await page.waitForTimeout(3000);
             }
-
-            // Check for visible input fields
-            const inputCount = await page.evaluate(() => {
-                return document.querySelectorAll('input').length;
-            });
-            const visibleInputCount = await page.evaluate(() => {
-                return Array.from(document.querySelectorAll('input')).filter(el => el.offsetParent !== null).length;
-            });
-
-            log('DEBUG', `Inputs: ${inputCount} total, ${visibleInputCount} visible`, accountNum);
-
-            if (visibleInputCount >= 3) {
-                formReady = true;
-                log('INFO', `Registration form loaded with ${visibleInputCount} visible fields`, accountNum);
-                break;
-            }
-
-            await page.waitForTimeout(2000);
         }
 
         if (!formReady) {
