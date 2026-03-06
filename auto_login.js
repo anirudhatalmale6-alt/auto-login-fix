@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const chokidar = require('chokidar');
 const { Configuration, NopeCHAApi } = require('nopecha');
+const Imap = require('imap');
 
 // Configure logging
 const logFile = fs.createWriteStream('auto_login.log', { flags: 'a' });
@@ -41,6 +42,117 @@ function parseProxy(proxyString) {
         username: username,
         password: password
     };
+}
+
+/**
+ * Retrieve OTP from Gmail via IMAP.
+ * Searches for the latest Amazon verification email and extracts the code.
+ */
+function getOtpFromEmail(imapConfig, targetEmail, timeout = 120000) {
+    return new Promise((resolve, reject) => {
+        const startTime = Date.now();
+        let attempts = 0;
+
+        function tryFetch() {
+            attempts++;
+            if (Date.now() - startTime > timeout) {
+                return reject(new Error(`OTP retrieval timed out after ${attempts} attempts`));
+            }
+
+            const imap = new Imap({
+                user: imapConfig.user,
+                password: imapConfig.password,
+                host: imapConfig.host || 'imap.gmail.com',
+                port: imapConfig.port || 993,
+                tls: true,
+                tlsOptions: { rejectUnauthorized: false },
+                connTimeout: 10000,
+                authTimeout: 10000,
+            });
+
+            imap.once('ready', () => {
+                imap.openBox('INBOX', false, (err, box) => {
+                    if (err) {
+                        imap.end();
+                        setTimeout(tryFetch, 5000);
+                        return;
+                    }
+
+                    // Search for recent emails from Amazon
+                    const since = new Date(Date.now() - 5 * 60 * 1000);
+                    const searchCriteria = [
+                        ['SINCE', since],
+                        ['OR',
+                            ['FROM', 'amazon'],
+                            ['FROM', 'hiring.amazon']
+                        ]
+                    ];
+
+                    if (targetEmail) {
+                        searchCriteria.push(['TO', targetEmail]);
+                    }
+
+                    imap.search(searchCriteria, (err, results) => {
+                        if (err || !results || results.length === 0) {
+                            imap.end();
+                            log('DEBUG', `OTP email not found yet (attempt ${attempts}), retrying in 5s...`);
+                            setTimeout(tryFetch, 5000);
+                            return;
+                        }
+
+                        const latestId = results[results.length - 1];
+                        const f = imap.fetch([latestId], { bodies: ['TEXT', 'HEADER.FIELDS (SUBJECT FROM TO DATE)'] });
+
+                        let emailBody = '';
+
+                        f.on('message', (msg) => {
+                            msg.on('body', (stream, info) => {
+                                let buffer = '';
+                                stream.on('data', (chunk) => { buffer += chunk.toString('utf8'); });
+                                stream.on('end', () => {
+                                    if (info.which === 'TEXT') {
+                                        emailBody = buffer;
+                                    }
+                                });
+                            });
+                        });
+
+                        f.once('end', () => {
+                            imap.end();
+
+                            // Extract OTP — look for 6-digit code first, then 4-8 digit
+                            const otpMatch = emailBody.match(/\b(\d{6})\b/);
+                            if (otpMatch) {
+                                resolve(otpMatch[1]);
+                            } else {
+                                const codeMatch = emailBody.match(/(?:code|otp|verification|pin)[:\s]*(\d{4,8})/i);
+                                if (codeMatch) {
+                                    resolve(codeMatch[1]);
+                                } else {
+                                    log('DEBUG', `No OTP code found in email (attempt ${attempts}), retrying...`);
+                                    setTimeout(tryFetch, 5000);
+                                }
+                            }
+                        });
+
+                        f.once('error', () => {
+                            imap.end();
+                            setTimeout(tryFetch, 5000);
+                        });
+                    });
+                });
+            });
+
+            imap.once('error', (err) => {
+                log('DEBUG', `IMAP error: ${err.message}, retrying...`);
+                setTimeout(tryFetch, 5000);
+            });
+
+            imap.connect();
+        }
+
+        tryFetch();
+    });
 }
 
 // Single account session manager
@@ -1370,6 +1482,52 @@ class AccountSession {
                         return true;
                     }
                 } catch (e) {}
+
+                // Check for OTP input field — Amazon may ask for a verification code
+                const otpSelectors = [
+                    'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
+                    'input[placeholder*="code" i]', 'input[placeholder*="otp" i]',
+                    'input[placeholder*="verification" i]', '#verificationCode', '#otp', '#code',
+                    'input[aria-label*="code" i]', 'input[aria-label*="verification" i]',
+                ];
+
+                let otpFieldFound = false;
+                let otpFieldSelector = null;
+                for (const sel of otpSelectors) {
+                    try {
+                        const el = await this.page.$(sel);
+                        if (el && await el.isVisible()) {
+                            otpFieldFound = true;
+                            otpFieldSelector = sel;
+                            break;
+                        }
+                    } catch (e) {}
+                }
+
+                if (otpFieldFound && this.config.email_imap) {
+                    log('INFO', `OTP input detected (${otpFieldSelector}), fetching OTP from email...`, this.accountId);
+                    try {
+                        const otp = await getOtpFromEmail(this.config.email_imap, this.account.email, 120000);
+                        log('INFO', `OTP retrieved: ${otp}`, this.accountId);
+
+                        // Fill OTP
+                        const otpInput = await this.page.$(otpFieldSelector);
+                        if (otpInput) {
+                            await otpInput.fill(otp);
+                            log('INFO', 'OTP filled into input field', this.accountId);
+                            await this.page.waitForTimeout(500);
+                        }
+
+                        // Click verify/continue after OTP
+                        // (will be handled by the button-clicking code below)
+                    } catch (otpErr) {
+                        log('ERROR', `OTP retrieval failed: ${otpErr.message}`, this.accountId);
+                        // Continue anyway — maybe the user will enter it manually
+                    }
+                } else if (otpFieldFound) {
+                    log('WARNING', 'OTP input found but no email_imap config — cannot auto-fill OTP', this.accountId);
+                    log('WARNING', 'Add "email_imap" section to config.json with Gmail IMAP credentials', this.accountId);
+                }
 
                 // Look for visible, enabled continue/submit buttons
                 let buttonClicked = false;
