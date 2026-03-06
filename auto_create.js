@@ -695,9 +695,32 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
 
                 await page.waitForTimeout(500);
 
-                // Click verify/submit
-                await clickContinueButton(page, accountNum);
+                // Click verify/submit button
+                const verifyClicked = await clickContinueButton(page, accountNum);
+                log('INFO', `Verify button clicked: ${verifyClicked}`, accountNum);
                 await page.waitForTimeout(3000);
+
+                // After OTP verify, Amazon may show additional Continue button(s)
+                // Loop to click them until we leave auth page or no more buttons
+                for (let postOtpRound = 1; postOtpRound <= 5; postOtpRound++) {
+                    const curUrl = page.url();
+                    if (!curUrl.includes('auth.hiring.amazon')) {
+                        log('INFO', 'Left auth page after OTP — success!', accountNum);
+                        break;
+                    }
+                    log('INFO', `Post-OTP button round ${postOtpRound}/5, URL: ${curUrl}`, accountNum);
+                    try {
+                        await page.waitForLoadState('networkidle', { timeout: 5000 });
+                    } catch (e) {}
+                    const clicked = await clickContinueButton(page, accountNum);
+                    if (clicked) {
+                        log('INFO', `Post-OTP button ${postOtpRound} clicked`, accountNum);
+                        await page.waitForTimeout(3000);
+                    } else {
+                        log('INFO', 'No more post-OTP buttons', accountNum);
+                        break;
+                    }
+                }
 
             } catch (e) {
                 log('ERROR', `OTP retrieval failed: ${e.message}`, accountNum);

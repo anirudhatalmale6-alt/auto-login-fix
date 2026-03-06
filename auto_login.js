@@ -3,7 +3,7 @@
  * Handles token expiration and automatic re-login for 100 accounts.
  */
 
-const SCRIPT_VERSION = 'v7.0';
+const SCRIPT_VERSION = 'v7.1';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -1696,32 +1696,138 @@ class AccountSession {
                         }
 
                         if (verifyClicked) {
-                            log('INFO', 'Verify/Continue button clicked after OTP, waiting for session...', this.accountId);
+                            log('INFO', 'Verify button clicked after OTP, waiting for response...', this.accountId);
 
-                            // Take debug screenshot after clicking verify
+                            // Wait for the verify API call to complete
+                            await this.page.waitForTimeout(3000);
+                            try {
+                                await this.page.waitForLoadState('networkidle', { timeout: 10000 });
+                            } catch (e) {}
+
+                            // Take debug screenshot after verify response
                             try {
                                 await this.page.screenshot({ path: 'debug_after_verify.png' });
                                 log('INFO', 'Debug screenshot saved: debug_after_verify.png', this.accountId);
                             } catch (e) {}
 
-                            // After confirm-otp → 200, the auth is DONE.
-                            // Wait for the page to redirect back to hiring.amazon.ca with a valid session.
-                            // Do NOT click any more buttons — that could click "Sign In" on the
-                            // redirected page and break the session.
-                            await this.page.waitForTimeout(5000);
+                            // After OTP verify → 200, Amazon often shows a "Continue" button.
+                            // We must click it to complete the login redirect.
+                            // Loop up to 5 times to click any remaining buttons until redirected.
+                            for (let postVerifyRound = 1; postVerifyRound <= 5; postVerifyRound++) {
+                                const currentPostUrl = this.page.url();
+                                log('INFO', `Post-verify round ${postVerifyRound}/5, URL: ${currentPostUrl}`, this.accountId);
 
-                            // Wait for navigation/redirect to complete
-                            try {
-                                await this.page.waitForLoadState('networkidle', { timeout: 10000 });
-                            } catch (e) {}
+                                // If we've left the auth page, login is complete
+                                if (!currentPostUrl.includes('auth.hiring.amazon')) {
+                                    log('INFO', 'Redirected away from auth page — login successful!', this.accountId);
+                                    this.lastLoginTime = new Date();
+                                    return true;
+                                }
 
-                            // Wait a bit more for session cookies to propagate
-                            await this.page.waitForTimeout(3000);
+                                // Look for and click any Continue/Submit/Next button
+                                let postBtnClicked = false;
 
-                            const postOtpUrl = this.page.url();
-                            log('INFO', `Post-OTP URL: ${postOtpUrl}`, this.accountId);
+                                // Log all buttons for debugging
+                                try {
+                                    const btns = await this.page.evaluate(() => {
+                                        return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                                            .filter(b => b.offsetParent !== null)
+                                            .map(b => ({
+                                                text: (b.textContent || b.value || '').trim().substring(0, 60),
+                                                disabled: b.disabled,
+                                                tag: b.tagName,
+                                                testComponent: b.getAttribute('data-test-component')
+                                            }));
+                                    });
+                                    log('INFO', `Visible buttons (post-verify round ${postVerifyRound}): ${JSON.stringify(btns)}`, this.accountId);
+                                } catch (e) {}
+
+                                // Strategy 1: Playwright text selectors
+                                const postVerifySelectors = [
+                                    'button:has-text("Continue")',
+                                    'button:has-text("Done")',
+                                    'button:has-text("Next")',
+                                    'button:has-text("Proceed")',
+                                    'button:has-text("Submit")',
+                                    'button:has-text("OK")',
+                                    'button:has-text("Go")',
+                                    '[role="button"]:has-text("Continue")',
+                                    '[role="button"]:has-text("Done")',
+                                ];
+
+                                for (const sel of postVerifySelectors) {
+                                    try {
+                                        const btn = await this.page.$(sel);
+                                        if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                                            const btnText = await btn.textContent().catch(() => '');
+                                            log('INFO', `Clicking post-verify button: "${btnText.trim()}" (${sel})`, this.accountId);
+                                            try {
+                                                await btn.click({ timeout: 5000 });
+                                            } catch (e) {
+                                                await btn.click({ force: true, timeout: 5000 });
+                                            }
+                                            postBtnClicked = true;
+                                            break;
+                                        }
+                                    } catch (e) {}
+                                }
+
+                                // Strategy 2: StencilReactButton
+                                if (!postBtnClicked) {
+                                    try {
+                                        const stencilBtns = await this.page.$$('button[data-test-component="StencilReactButton"]');
+                                        for (const btn of stencilBtns) {
+                                            if (await btn.isVisible() && await btn.isEnabled()) {
+                                                const text = await btn.textContent().catch(() => '');
+                                                const lower = text.toLowerCase().trim();
+                                                // Skip sign-in buttons — clicking those would break the session
+                                                if (lower.includes('sign in') || lower.includes('login') || lower.includes('log in')) continue;
+                                                log('INFO', `Clicking StencilReactButton post-verify: "${text.trim()}"`, this.accountId);
+                                                await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true }));
+                                                postBtnClicked = true;
+                                                break;
+                                            }
+                                        }
+                                    } catch (e) {}
+                                }
+
+                                // Strategy 3: JS click any button (except sign-in/resend/back/cancel)
+                                if (!postBtnClicked) {
+                                    const jsResult = await this.page.evaluate(() => {
+                                        const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                                        for (const btn of buttons) {
+                                            if (btn.offsetParent === null || btn.disabled) continue;
+                                            const text = (btn.textContent || btn.value || '').toLowerCase().trim();
+                                            if (text.includes('sign in') || text.includes('login') || text.includes('log in')) continue;
+                                            if (text.includes('resend') || text.includes('back') || text.includes('cancel')) continue;
+                                            if (text.length === 0) continue;
+                                            btn.click();
+                                            return (btn.textContent || btn.value || '').trim().substring(0, 60);
+                                        }
+                                        return null;
+                                    });
+                                    if (jsResult) {
+                                        log('INFO', `Clicked post-verify button via JS: "${jsResult}"`, this.accountId);
+                                        postBtnClicked = true;
+                                    }
+                                }
+
+                                if (postBtnClicked) {
+                                    // Wait for page to respond after clicking
+                                    await this.page.waitForTimeout(3000);
+                                    try {
+                                        await this.page.waitForLoadState('networkidle', { timeout: 10000 });
+                                    } catch (e) {}
+                                    await this.page.waitForTimeout(2000);
+                                } else {
+                                    log('INFO', 'No more post-verify buttons to click', this.accountId);
+                                    break;
+                                }
+                            }
 
                             // Take final screenshot
+                            const postOtpUrl = this.page.url();
+                            log('INFO', `Post-OTP final URL: ${postOtpUrl}`, this.accountId);
                             try {
                                 await this.page.screenshot({ path: 'debug_post_otp_final.png' });
                                 log('INFO', 'Debug screenshot saved: debug_post_otp_final.png', this.accountId);
@@ -1729,17 +1835,17 @@ class AccountSession {
 
                             // If we're no longer on the auth page, login is complete
                             if (!postOtpUrl.includes('auth.hiring.amazon')) {
-                                log('INFO', 'OTP verified, redirected away from auth page — login successful!', this.accountId);
+                                log('INFO', 'OTP verified and redirected — login successful!', this.accountId);
                                 this.lastLoginTime = new Date();
                                 return true;
                             }
 
-                            // If still on auth page, navigate to hiring.amazon.ca to check session
-                            log('INFO', 'Still on auth page, navigating to hiring.amazon.ca to verify session...', this.accountId);
+                            // Last resort: navigate to hiring.amazon.ca to check session
+                            log('INFO', 'Still on auth page, navigating to hiring.amazon.ca...', this.accountId);
                             await this.page.goto('https://hiring.amazon.ca/', { waitUntil: 'networkidle', timeout: 30000 });
                             await this.page.waitForTimeout(3000);
 
-                            log('INFO', `Final URL: ${this.page.url()}`, this.accountId);
+                            log('INFO', `Final URL after navigation: ${this.page.url()}`, this.accountId);
                             this.lastLoginTime = new Date();
                             return true;
                         } else {
