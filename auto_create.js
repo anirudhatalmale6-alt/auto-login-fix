@@ -59,16 +59,126 @@ async function solveCaptcha(page, nopecha, accountNum) {
 
         await page.waitForTimeout(2000);
 
-        // Click audio button
-        const audioBtn = await page.$('#amzn-btn-audio-internal');
-        if (audioBtn) {
-            await audioBtn.click({ force: true });
-            log('INFO', 'Audio button clicked', accountNum);
-            await page.waitForTimeout(3000);
-        } else {
-            log('WARNING', 'Audio button not found', accountNum);
+        // Click audio button — may be in regular DOM, inside #captchaModal, or inside Shadow DOM
+        let audioClicked = false;
+
+        // Strategy 1: Direct selector
+        for (const sel of ['#captchaModal #amzn-btn-audio-internal', '#amzn-btn-audio-internal']) {
+            try {
+                const btn = await page.$(sel);
+                if (btn) {
+                    const isVisible = await btn.isVisible().catch(() => true);
+                    const isEnabled = await btn.isEnabled().catch(() => true);
+                    if (isVisible && isEnabled) {
+                        await btn.click({ force: true, timeout: 5000 });
+                        log('INFO', `Audio button clicked via: ${sel}`, accountNum);
+                        audioClicked = true;
+                        break;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Strategy 2: Wait for it to appear (may render with delay)
+        if (!audioClicked) {
+            try {
+                await page.waitForSelector('#amzn-btn-audio-internal', { timeout: 10000, state: 'attached' });
+                const btn = await page.$('#amzn-btn-audio-internal');
+                if (btn) {
+                    await btn.click({ force: true });
+                    log('INFO', 'Audio button clicked after wait', accountNum);
+                    audioClicked = true;
+                }
+            } catch (e) {
+                log('DEBUG', `Audio button wait failed: ${e.message.substring(0, 60)}`, accountNum);
+            }
+        }
+
+        // Strategy 3: JavaScript DOM search (including inside captcha modal)
+        if (!audioClicked) {
+            try {
+                const clicked = await page.evaluate(() => {
+                    // Try in captcha modal
+                    const modal = document.querySelector('#captchaModal');
+                    if (modal) {
+                        const btn = modal.querySelector('#amzn-btn-audio-internal');
+                        if (btn) { btn.click(); return 'modal'; }
+                    }
+                    // Try global
+                    const globalBtn = document.querySelector('#amzn-btn-audio-internal');
+                    if (globalBtn) { globalBtn.click(); return 'global'; }
+                    // Try inside any shadow roots
+                    function findInShadow(root) {
+                        const btn = root.querySelector('#amzn-btn-audio-internal');
+                        if (btn) { btn.click(); return true; }
+                        const els = root.querySelectorAll('*');
+                        for (const el of els) {
+                            if (el.shadowRoot) {
+                                const found = findInShadow(el.shadowRoot);
+                                if (found) return true;
+                            }
+                        }
+                        return false;
+                    }
+                    const waf = document.querySelector('awswaf-captcha');
+                    if (waf && waf.shadowRoot && findInShadow(waf.shadowRoot)) return 'shadow';
+                    // Search all shadow roots
+                    const allEls = document.querySelectorAll('*');
+                    for (const el of allEls) {
+                        if (el.shadowRoot && findInShadow(el.shadowRoot)) return 'shadow-global';
+                    }
+                    return null;
+                });
+                if (clicked) {
+                    log('INFO', `Audio button clicked via JS: ${clicked}`, accountNum);
+                    audioClicked = true;
+                }
+            } catch (e) {
+                log('DEBUG', `JS audio button search failed: ${e.message.substring(0, 60)}`, accountNum);
+            }
+        }
+
+        // Strategy 4: Find any button with "audio" in its text/aria-label
+        if (!audioClicked) {
+            try {
+                const clicked = await page.evaluate(() => {
+                    function searchDOM(root) {
+                        const buttons = root.querySelectorAll('button, [role="button"]');
+                        for (const btn of buttons) {
+                            const text = (btn.textContent || '').toLowerCase();
+                            const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            const id = (btn.id || '').toLowerCase();
+                            if (text.includes('audio') || aria.includes('audio') || id.includes('audio')) {
+                                btn.click();
+                                return btn.id || btn.textContent.trim().substring(0, 30);
+                            }
+                        }
+                        const els = root.querySelectorAll('*');
+                        for (const el of els) {
+                            if (el.shadowRoot) {
+                                const r = searchDOM(el.shadowRoot);
+                                if (r) return r;
+                            }
+                        }
+                        return null;
+                    }
+                    return searchDOM(document);
+                });
+                if (clicked) {
+                    log('INFO', `Audio button clicked via text search: ${clicked}`, accountNum);
+                    audioClicked = true;
+                }
+            } catch (e) {}
+        }
+
+        if (!audioClicked) {
+            log('WARNING', 'Audio button not found after all strategies', accountNum);
+            // Take debug screenshot
+            try { await page.screenshot({ path: 'debug_captcha_no_audio.png' }); } catch (e) {}
             return false;
         }
+
+        await page.waitForTimeout(3000);
 
         // Extract audio from Shadow DOM
         let audioData = null;
@@ -1451,6 +1561,16 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
  *
  * The email and phone are "static" (same forwarding inbox receives all OTPs).
  */
+/**
+ * Generate a random US phone number (10 digits, area code 200-999)
+ */
+function generateRandomPhone() {
+    const areaCode = Math.floor(Math.random() * 800) + 200; // 200-999
+    const prefix = Math.floor(Math.random() * 900) + 100;   // 100-999
+    const line = Math.floor(Math.random() * 9000) + 1000;    // 1000-9999
+    return `${areaCode}${prefix}${line}`;
+}
+
 function generateAccounts(config) {
     const accounts = [];
     const count = config.create.count || 100;
@@ -1458,7 +1578,8 @@ function generateAccounts(config) {
     const pin = config.create.default_pin || '112233';
     const firstName = config.create.first_name || 'John';
     const lastName = config.create.last_name || 'Doe';
-    const phone = config.create.phone || ''; // Static phone number for all accounts
+    const phone = config.create.phone || ''; // Static phone, or empty for random
+    const randomPhone = config.create.random_phone !== false; // Default: true — generate random phone for each account
     const startIndex = config.create.start_index || 1;
 
     if (config.create.emails && Array.isArray(config.create.emails)) {
@@ -1470,7 +1591,7 @@ function generateAccounts(config) {
                 confirmPin: pin,
                 firstName: firstName,
                 lastName: lastName,
-                phone: phone,
+                phone: randomPhone ? generateRandomPhone() : phone,
             });
         }
     } else if (emailTemplate) {
@@ -1482,11 +1603,12 @@ function generateAccounts(config) {
                 confirmPin: pin,
                 firstName: firstName,
                 lastName: lastName,
-                phone: phone,
+                phone: randomPhone ? generateRandomPhone() : phone,
             });
         }
     }
 
+    log('INFO', `Generated ${accounts.length} accounts (random_phone: ${randomPhone})`);
     return accounts;
 }
 
