@@ -410,7 +410,16 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         }
         await page.waitForTimeout(2000);
 
-        // Dismiss any popups
+        // Dismiss cookie consent banner
+        try {
+            const consentBtn = await page.$('button:has-text("I consent"), button:has-text("Accept"), button:has-text("Got it"), #onetrust-accept-btn-handler');
+            if (consentBtn && await consentBtn.isVisible()) {
+                await consentBtn.click();
+                log('INFO', 'Dismissed cookie consent banner', accountNum);
+                await page.waitForTimeout(500);
+            }
+        } catch (e) {}
+        // Dismiss any other popups
         try {
             await page.keyboard.press('Escape');
             await page.waitForTimeout(500);
@@ -535,70 +544,283 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         // Step 4: Fill in registration form
         log('INFO', 'Filling registration form...', accountNum);
 
-        // Fill name fields
-        const nameSelectors = {
-            firstName: ['#firstName', 'input[name="firstName"]', 'input[name="first_name"]', 'input[placeholder*="first" i]'],
-            lastName: ['#lastName', 'input[name="lastName"]', 'input[name="last_name"]', 'input[placeholder*="last" i]'],
-            email: ['#email', '#login', 'input[name="email"]', 'input[name="login EmailId"]', 'input[type="email"]', 'input[placeholder*="email" i]'],
-            phone: ['#phoneNumber', 'input[name="phone"]', 'input[name="phoneNumber"]', 'input[type="tel"]'],
-            pin: ['#pin', 'input[name="pin"]', 'input[type="password"]'],
-            confirmPin: ['#confirmPin', 'input[name="confirmPin"]', '#confirm-pin', 'input[name="confirm_pin"]'],
-        };
+        // Dismiss cookie consent on registration page too
+        try {
+            const consentBtn = await page.$('button:has-text("I consent"), button:has-text("Accept")');
+            if (consentBtn && await consentBtn.isVisible()) {
+                await consentBtn.click();
+                log('INFO', 'Dismissed cookie consent on registration page', accountNum);
+                await page.waitForTimeout(500);
+            }
+        } catch (e) {}
 
-        // Fill each field
-        for (const [field, selectors] of Object.entries(nameSelectors)) {
-            const value = accountData[field];
+        // Take screenshot of registration form for debugging
+        try {
+            await page.screenshot({ path: 'debug_registration_form.png' });
+            log('INFO', 'Debug screenshot saved: debug_registration_form.png', accountNum);
+        } catch (e) {}
+
+        // Log all visible input fields on the page for debugging
+        try {
+            const allInputs = await page.evaluate(() => {
+                return Array.from(document.querySelectorAll('input, select, textarea'))
+                    .filter(el => el.offsetParent !== null)
+                    .map(el => ({
+                        tag: el.tagName,
+                        type: el.type,
+                        name: el.name,
+                        id: el.id,
+                        placeholder: el.placeholder,
+                        ariaLabel: el.getAttribute('aria-label'),
+                        label: (() => {
+                            // Try to find associated label
+                            if (el.id) {
+                                const lbl = document.querySelector(`label[for="${el.id}"]`);
+                                if (lbl) return lbl.textContent.trim();
+                            }
+                            // Check parent for label
+                            const parent = el.closest('.form-group, .field, [class*="field"], [class*="input"]');
+                            if (parent) {
+                                const lbl = parent.querySelector('label');
+                                if (lbl) return lbl.textContent.trim();
+                            }
+                            return '';
+                        })()
+                    }));
+            });
+            log('INFO', `Registration form fields: ${JSON.stringify(allInputs)}`, accountNum);
+        } catch (e) {}
+
+        // Amazon Hiring registration form fields:
+        // - Legal first name * (placeholder: "First name")
+        // - Legal middle name * (with "I don't have a middle name" checkbox)
+        // - Legal surname * (placeholder: "Surname")
+        // - Preferred first name (optional)
+        // - Email or mobile number
+        // - PIN
+        // - Confirm PIN
+
+        // Fill fields using multiple selector strategies
+        const fieldMappings = [
+            {
+                name: 'firstName',
+                value: accountData.firstName,
+                selectors: [
+                    '#firstName', 'input[name="firstName"]', 'input[name="first_name"]',
+                    'input[placeholder*="First name" i]', 'input[placeholder*="first" i]',
+                    'input[aria-label*="first name" i]', 'input[data-test-id*="firstName" i]',
+                ]
+            },
+            {
+                name: 'lastName',
+                value: accountData.lastName,
+                selectors: [
+                    '#lastName', '#surname', 'input[name="lastName"]', 'input[name="surname"]',
+                    'input[name="last_name"]', 'input[placeholder*="Surname" i]',
+                    'input[placeholder*="last" i]', 'input[placeholder*="surname" i]',
+                    'input[aria-label*="surname" i]', 'input[aria-label*="last name" i]',
+                    'input[data-test-id*="lastName" i]', 'input[data-test-id*="surname" i]',
+                ]
+            },
+            {
+                name: 'email',
+                value: accountData.email,
+                selectors: [
+                    '#email', '#login', 'input[name="email"]', 'input[name="login EmailId"]',
+                    'input[type="email"]', 'input[placeholder*="email" i]',
+                    'input[placeholder*="Email or mobile" i]',
+                    'input[aria-label*="email" i]', 'input[data-test-id*="email" i]',
+                ]
+            },
+            {
+                name: 'phone',
+                value: accountData.phone,
+                selectors: [
+                    '#phoneNumber', '#phone', 'input[name="phone"]', 'input[name="phoneNumber"]',
+                    'input[name="phone_number"]', 'input[type="tel"]',
+                    'input[placeholder*="phone" i]', 'input[placeholder*="mobile" i]',
+                    'input[aria-label*="phone" i]',
+                ]
+            },
+            {
+                name: 'pin',
+                value: accountData.pin,
+                selectors: [
+                    '#pin', 'input[name="pin"]', 'input[type="password"]:first-of-type',
+                    'input[placeholder*="pin" i]', 'input[placeholder*="password" i]',
+                    'input[aria-label*="pin" i]', 'input[data-test-id*="pin" i]',
+                ]
+            },
+            {
+                name: 'confirmPin',
+                value: accountData.confirmPin || accountData.pin,
+                selectors: [
+                    '#confirmPin', '#confirm-pin', 'input[name="confirmPin"]',
+                    'input[name="confirm_pin"]', 'input[name="confirmPassword"]',
+                    'input[type="password"]:nth-of-type(2)',
+                    'input[placeholder*="confirm" i]', 'input[placeholder*="re-enter" i]',
+                    'input[aria-label*="confirm" i]', 'input[data-test-id*="confirmPin" i]',
+                ]
+            },
+        ];
+
+        for (const { name, value, selectors } of fieldMappings) {
             if (!value) continue;
-
+            let filled = false;
             for (const sel of selectors) {
                 try {
                     const el = await page.$(sel);
                     if (el && await el.isVisible()) {
                         await el.fill(value);
-                        log('INFO', `Filled ${field}: ${field === 'pin' || field === 'confirmPin' ? '***' : value}`, accountNum);
+                        log('INFO', `Filled ${name}: ${name.includes('pin') || name.includes('Pin') ? '***' : value}`, accountNum);
                         await page.waitForTimeout(300);
+                        filled = true;
                         break;
                     }
                 } catch (e) {}
             }
+            if (!filled) {
+                log('WARNING', `Could not find field: ${name}`, accountNum);
+            }
         }
 
-        // Handle any checkboxes (terms, privacy, etc.)
+        // Handle "I don't have a middle name" checkbox (Amazon requires middle name OR this checkbox)
+        try {
+            const noMiddleNameCb = await page.$('input[type="checkbox"]');
+            // Look for checkbox near "middle name" text
+            const middleNameCheckbox = await page.evaluate(() => {
+                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                for (const cb of checkboxes) {
+                    const parent = cb.closest('div, label, span, li');
+                    if (parent) {
+                        const text = parent.textContent.toLowerCase();
+                        if (text.includes('middle name') || text.includes('don\'t have')) {
+                            return { found: true, id: cb.id, name: cb.name };
+                        }
+                    }
+                }
+                return { found: false };
+            });
+
+            if (middleNameCheckbox.found) {
+                let cbSelector = 'input[type="checkbox"]';
+                if (middleNameCheckbox.id) cbSelector = `#${middleNameCheckbox.id}`;
+                else if (middleNameCheckbox.name) cbSelector = `input[name="${middleNameCheckbox.name}"]`;
+
+                const cb = await page.$(cbSelector);
+                if (cb && await cb.isVisible() && !(await cb.isChecked())) {
+                    await cb.check();
+                    log('INFO', 'Checked "I don\'t have a middle name" checkbox', accountNum);
+                    await page.waitForTimeout(300);
+                }
+            } else {
+                log('DEBUG', 'No middle name checkbox found', accountNum);
+            }
+        } catch (e) {
+            log('DEBUG', `Middle name checkbox error: ${e.message}`, accountNum);
+        }
+
+        // Handle terms/privacy checkboxes (but NOT the middle name one we already handled)
         try {
             const checkboxes = await page.$$('input[type="checkbox"]');
             for (const cb of checkboxes) {
                 if (await cb.isVisible() && !(await cb.isChecked())) {
-                    await cb.check();
-                    log('INFO', 'Checked checkbox (terms/privacy)', accountNum);
+                    // Check the label — only check terms/privacy/consent checkboxes
+                    const cbInfo = await page.evaluate(el => {
+                        const parent = el.closest('div, label, span, li');
+                        return parent ? parent.textContent.toLowerCase() : '';
+                    }, cb);
+                    if (cbInfo.includes('terms') || cbInfo.includes('privacy') || cbInfo.includes('agree') || cbInfo.includes('consent')) {
+                        await cb.check();
+                        log('INFO', 'Checked terms/privacy checkbox', accountNum);
+                    }
                 }
             }
+        } catch (e) {}
+
+        // Scroll down to make sure submit button is visible
+        try {
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await page.waitForTimeout(500);
+        } catch (e) {}
+
+        // Take screenshot before submit for debugging
+        try {
+            await page.screenshot({ path: 'debug_before_submit.png' });
+            log('INFO', 'Debug screenshot saved: debug_before_submit.png', accountNum);
         } catch (e) {}
 
         await page.waitForTimeout(1000);
 
         // Step 5: Click submit/create account button
         log('INFO', 'Clicking submit/create button...', accountNum);
-        await clickContinueButton(page, accountNum);
+
+        // Try specific submit button selectors first
+        let submitClicked = false;
+        const submitSelectors = [
+            'button:has-text("Create account")',
+            'button:has-text("Create Account")',
+            'button:has-text("Register")',
+            'button:has-text("Sign up")',
+            'button:has-text("Submit")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+        ];
+
+        for (const sel of submitSelectors) {
+            try {
+                const btn = await page.$(sel);
+                if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                    const text = await btn.textContent().catch(() => '');
+                    log('INFO', `Clicking submit button: "${text.trim()}" (${sel})`, accountNum);
+                    await btn.click({ timeout: 5000 });
+                    submitClicked = true;
+                    break;
+                }
+            } catch (e) {}
+        }
+
+        // Fallback: StencilReactButton (but only the LAST one — skip navigation buttons)
+        if (!submitClicked) {
+            try {
+                const stencilBtns = await page.$$('button[data-test-component="StencilReactButton"]');
+                // Click the last visible enabled one (submit buttons are usually at the bottom)
+                for (let i = stencilBtns.length - 1; i >= 0; i--) {
+                    if (await stencilBtns[i].isVisible() && await stencilBtns[i].isEnabled()) {
+                        const text = await stencilBtns[i].textContent().catch(() => '');
+                        log('INFO', `Clicking StencilReactButton (bottom): "${text.trim()}"`, accountNum);
+                        await stencilBtns[i].click({ timeout: 5000 });
+                        submitClicked = true;
+                        break;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Last fallback: clickContinueButton
+        if (!submitClicked) {
+            await clickContinueButton(page, accountNum);
+        }
+
         await page.waitForTimeout(3000);
 
-        // Step 5b: Check for "already registered" or other errors — skip if so
+        // Step 5b: Check for "already registered" errors
+        // ONLY check error elements, NOT full page text (registration page has "Already have an account?" link)
         const alreadyRegistered = await page.evaluate(() => {
-            const pageText = document.body.innerText.toLowerCase();
-            const errorEls = document.querySelectorAll('.error, [role="alert"], .alert-danger, .error-message, [class*="error"], [class*="alert"]');
+            const errorEls = document.querySelectorAll('[role="alert"], .error-message, [class*="error-text"], [class*="errorMessage"], .form-error, .field-error');
             const errorTexts = Array.from(errorEls).map(e => e.textContent.toLowerCase()).join(' ');
-            const allText = pageText + ' ' + errorTexts;
 
-            if (allText.includes('already registered') || allText.includes('already exists') ||
-                allText.includes('already have an account') || allText.includes('account already') ||
-                allText.includes('email already') || allText.includes('already in use') ||
-                allText.includes('duplicate') || allText.includes('already been registered')) {
-                return true;
+            if (errorTexts.includes('already registered') || errorTexts.includes('already exists') ||
+                errorTexts.includes('email already') || errorTexts.includes('already in use') ||
+                errorTexts.includes('duplicate') || errorTexts.includes('already been registered') ||
+                errorTexts.includes('account with this email')) {
+                return errorTexts.substring(0, 200);
             }
-            return false;
+            return null;
         });
 
         if (alreadyRegistered) {
-            log('WARNING', `Account already registered: ${accountData.email} — SKIPPING`, accountNum);
+            log('WARNING', `Account already registered: ${accountData.email} — error: "${alreadyRegistered}" — SKIPPING`, accountNum);
             await context.close();
             return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
         }
