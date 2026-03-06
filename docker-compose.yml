@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  auto-login:
+    build: .
+    container_name: auto-login-service
+    volumes:
+      - ./config.json:/app/config.json
+      - ./logs:/app/logs
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

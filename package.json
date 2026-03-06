@@ -1,0 +1,29 @@
+{
+  "name": "auto-login",
+  "version": "1.0.0",
+  "description": "Auto-login service that keeps users logged in by refreshing every 2 hours",
+  "main": "auto_login.js",
+  "scripts": {
+    "start": "node auto_login.js",
+    "dev": "nodemon auto_login.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "keywords": [
+    "automation",
+    "playwright",
+    "auto-login",
+    "aws"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chokidar": "^3.5.3",
+    "playwright": "^1.58.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "website": {
+    "url": "https://auth.hiring.amazon.com/#/login"
+  },
+  "accounts": [
+    {
+      "email": "account1@example.com",
+      "pin": "pin1"
+    },
+    {
+      "email": "account2@example.com",
+      "pin": "pin2"
+    }
+  ],
+  "selectors": {
+    "email_field": "#login[name='login EmailId'], #login, input[name='login EmailId']",
+    "continue_button": "button[data-test-component='StencilReactButton']",
+    "pin_field": "#pin, input[type='password'], input[name='pin'], input[placeholder*='pin' i]",
+    "login_button": "button[data-test-component='StencilReactButton'], button[type='submit'], button:has-text('Sign in'), button:has-text('Login')",
+    "logout_button": "#logout",
+    "logged_in_indicator": ".user-menu, [data-testid='user-menu']"
+  },
+  "timing": {
+    "login_interval_hours": 2,
+    "max_runtime_hours": 24,
+    "page_load_timeout": 30000,
+    "action_delay": 1000,
+    "concurrent_limit": 10
+  }
+}

@@ -1,0 +1,1811 @@
+/**
+ * Auto-login script that keeps multiple users logged in by refreshing every 2 hours.
+ * Handles token expiration and automatic re-login for 100 accounts.
+ */
+
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const chokidar = require('chokidar');
+
+// Configure logging
+const logFile = fs.createWriteStream('auto_login.log', { flags: 'a' });
+
+function log(level, message, accountId = null) {
+    const timestamp = new Date().toISOString();
+    const accountPrefix = accountId !== null ? `[Account ${accountId}] ` : '';
+    const logMessage = `${timestamp} - ${level} - ${accountPrefix}${message}`;
+    console.log(logMessage);
+    logFile.write(logMessage + '\n');
+}
+
+// Helper function to parse proxy string format: host:port:username:password
+function parseProxy(proxyString) {
+    if (!proxyString) return null;
+    
+    const parts = proxyString.split(':');
+    if (parts.length !== 4) {
+        log('WARNING', `Invalid proxy format: ${proxyString}. Expected format: host:port:username:password`);
+        return null;
+    }
+    
+    const [host, port, username, password] = parts;
+    
+    // Playwright proxy authentication: use separate username/password fields
+    // Pass credentials as-is - Playwright will handle encoding for HTTP Basic Auth
+    // Special characters in password (like +) should be passed literally
+    // Playwright will automatically encode them when creating Proxy-Authorization header
+    return {
+        server: `http://${host}:${port}`,
+        username: username,
+        password: password
+    };
+}
+
+// Single account session manager
+class AccountSession {
+    constructor(accountId, account, config, browser, proxy = null) {
+        this.accountId = accountId;
+        this.account = account;
+        this.config = config;
+        this.browser = browser;
+        this.proxy = proxy ? parseProxy(proxy) : null;
+        this.context = null;
+        this.page = null;
+        this.lastLoginTime = null;
+        this.csrfToken = null; // Store CSRF token for requests
+    }
+
+    async initContext() {
+        // Generate realistic viewport (1280x720 ± small delta)
+        // Common resolutions: 1280x720, 1366x768, 1920x1080, 1440x900
+        const viewports = [
+            { width: 1366, height: 768 },
+        ];
+        const randomViewport = viewports[Math.floor(Math.random() * viewports.length)];
+        // Add small random variation (±20px)
+        const viewport = {
+            width: randomViewport.width + Math.floor(Math.random() * 41) - 20,
+            height: randomViewport.height + Math.floor(Math.random() * 41) - 20
+        };
+        
+        // Use current Chrome version (145) matching the request headers
+        const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
+        
+        // Determine locale and timezone based on proxy region
+        // Default to North America (en-US, America/New_York) if no proxy or unknown
+        let locale = 'en-US';
+        let timezoneId = 'America/New_York';
+        
+        if (this.proxy && this.proxy.server) {
+            // Try to infer region from proxy hostname
+            const proxyHost = this.proxy.server.toLowerCase();
+            if (proxyHost.includes('.ca') || proxyHost.includes('canada')) {
+                locale = 'en-CA';
+                timezoneId = 'America/Toronto';
+            } else if (proxyHost.includes('.uk') || proxyHost.includes('united-kingdom')) {
+                locale = 'en-GB';
+                timezoneId = 'Europe/London';
+            } else if (proxyHost.includes('.de') || proxyHost.includes('germany')) {
+                locale = 'de-DE';
+                timezoneId = 'Europe/Berlin';
+            } else if (proxyHost.includes('.fr') || proxyHost.includes('france')) {
+                locale = 'fr-FR';
+                timezoneId = 'Europe/Paris';
+            } else if (proxyHost.includes('.jp') || proxyHost.includes('japan')) {
+                locale = 'ja-JP';
+                timezoneId = 'Asia/Tokyo';
+            }
+            // Default to en-US for US proxies or unknown
+        }
+        
+        const contextOptions = {
+            viewport: viewport,
+            userAgent: userAgent,
+            locale: locale,
+            timezoneId: timezoneId
+        };
+        
+        // Add proxy if available
+        if (this.proxy) {
+            contextOptions.proxy = this.proxy;
+            log('INFO', `Using proxy: ${this.proxy.server}`, this.accountId);
+            log('DEBUG', `Proxy username: ${this.proxy.username ? this.proxy.username.substring(0, 3) + '***' : 'not set'}`, this.accountId);
+            log('DEBUG', `Proxy password: ${this.proxy.password ? '***' : 'not set'}`, this.accountId);
+            log('DEBUG', `Locale: ${locale}, Timezone: ${timezoneId} (inferred from proxy)`, this.accountId);
+        } else {
+            log('INFO', 'No proxy configured for this account', this.accountId);
+            log('DEBUG', `Locale: ${locale}, Timezone: ${timezoneId} (default)`, this.accountId);
+        }
+        
+        log('DEBUG', `Viewport: ${viewport.width}x${viewport.height}`, this.accountId);
+        log('DEBUG', `User-Agent: ${userAgent}`, this.accountId);
+        
+        this.context = await this.browser.newContext(contextOptions);
+        
+        // Set geolocation to null to deny location access
+        await this.context.setGeolocation({ latitude: 0, longitude: 0 });
+        await this.context.setExtraHTTPHeaders({
+            'Accept-Language': `${locale},${locale.split('-')[0]};q=0.9`
+        });
+        
+        this.page = await this.context.newPage();
+        
+        // IMPORTANT: Do NOT use page.route() to intercept/modify requests.
+        // Playwright's route.continue({ headers }) REPLACES all browser-managed headers,
+        // which strips cookies (including aws-waf-token), Origin, and Referer.
+        // This causes AWS CloudFront WAF to return 403.
+        // Instead, let the browser handle all requests naturally — it will automatically
+        // include all cookies, Origin, Referer, and Sec-Fetch-* headers correctly.
+
+        // Use passive response monitoring for debugging only
+        this.page.on('response', async (response) => {
+            const url = response.url();
+            const status = response.status();
+            const method = response.request().method();
+
+            if (method === 'POST' && (url.includes('sign-in') || url.includes('authentication'))) {
+                log('INFO', `POST ${url.substring(0, 100)} → ${status}`, this.accountId);
+                if (status === 403) {
+                    log('ERROR', `403 on POST request — WAF or server blocked the request`, this.accountId);
+                    try {
+                        const body = await response.text();
+                        log('DEBUG', `403 body (first 300 chars): ${body.substring(0, 300)}`, this.accountId);
+                    } catch (e) {}
+                }
+            }
+        });
+        
+        // Stealth evasions — hide automation signals from WAF/bot detection
+        await this.page.addInitScript(() => {
+            // Remove webdriver flag
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+            // Override geolocation API
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition = function(success, error) {
+                    if (error) error({ code: 1, message: 'User denied Geolocation' });
+                };
+                navigator.geolocation.watchPosition = function(success, error) {
+                    if (error) error({ code: 1, message: 'User denied Geolocation' });
+                };
+            }
+
+            // Fix chrome.runtime to look like a real browser
+            window.chrome = window.chrome || {};
+            window.chrome.runtime = window.chrome.runtime || {};
+
+            // Fix permissions API
+            const originalQuery = window.navigator.permissions?.query;
+            if (originalQuery) {
+                window.navigator.permissions.query = (parameters) =>
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(parameters);
+            }
+
+            // Fix plugins to look like real Chrome
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+
+            // Fix languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+        });
+        
+        log('INFO', `Browser context initialized with location access blocked and request headers configured`, this.accountId);
+    }
+
+    async _findSelector(selectorString, timeout = 5000) {
+        const selectors = selectorString.split(',').map(s => s.trim());
+        for (const selector of selectors) {
+            try {
+                await this.page.waitForSelector(selector, { timeout, state: 'visible' });
+                const element = await this.page.$(selector);
+                if (element) {
+                    return selector;
+                }
+            } catch (error) {
+                // Continue to next selector
+            }
+        }
+        return selectors[0];
+    }
+
+    async _waitForWafToken(maxWaitTime = 10000) {
+        // Wait specifically for the aws-waf-token cookie — this is what CloudFront WAF checks.
+        // Other tracking cookies (Adobe, mbox, etc.) are NOT required for the sign-in POST.
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < maxWaitTime) {
+            const cookies = await this.context.cookies();
+            const wafToken = cookies.find(c => c.name === 'aws-waf-token');
+
+            if (wafToken) {
+                log('INFO', `aws-waf-token found (${cookies.length} total cookies)`, this.accountId);
+                return true;
+            }
+
+            await this.page.waitForTimeout(500);
+        }
+
+        log('WARNING', `aws-waf-token not found after ${maxWaitTime}ms`, this.accountId);
+        return false;
+    }
+
+    async login() {
+        try {
+            log('INFO', '=== LOGIN FUNCTION CALLED ===', this.accountId);
+            log('INFO', `Page object exists: ${this.page !== null}`, this.accountId);
+            
+            if (!this.page) {
+                log('ERROR', 'Page is null, cannot proceed with login', this.accountId);
+                throw new Error('Page not initialized');
+            }
+            
+            // Step 1: Navigate to hiring.amazon.ca first
+            const hiringUrl = 'https://hiring.amazon.ca';
+            log('INFO', `Step 1: Navigating to ${hiringUrl}`, this.accountId);
+            
+            // Add response listener to check for errors
+            let responseError = null;
+            const responseHandler = async (response) => {
+                const status = response.status();
+                const url = response.url();
+                if (status >= 400) {
+                    responseError = {
+                        status: status,
+                        url: url,
+                        statusText: response.statusText()
+                    };
+                    
+                    // Special handling for 407 Proxy Authentication Required
+                    if (status === 407) {
+                        log('ERROR', `HTTP 407 Proxy Authentication Required when loading ${url}`, this.accountId);
+                        log('ERROR', 'This indicates the proxy credentials are incorrect or not being sent properly', this.accountId);
+                        if (this.proxy) {
+                            log('ERROR', `Proxy server: ${this.proxy.server}`, this.accountId);
+                            log('ERROR', `Proxy username: ${this.proxy.username ? this.proxy.username.substring(0, 3) + '***' : 'not set'}`, this.accountId);
+                            log('ERROR', 'Please verify your proxy credentials in proxies.json are correct', this.accountId);
+                            log('ERROR', 'You can test the proxy with: curl -x http://username:password@host:port https://httpbin.org/ip', this.accountId);
+                        } else {
+                            log('ERROR', 'No proxy configured but received 407 error - this is unexpected', this.accountId);
+                        }
+                    } else if (url.includes('hiring.amazon.ca') && status >= 400) {
+                        log('ERROR', `HTTP ${status} error when loading ${url}: ${response.statusText()}`, this.accountId);
+                    }
+                }
+            };
+            this.page.on('response', responseHandler);
+            
+            // Try navigation with retry logic
+            let navigationSuccess = false;
+            const maxRetries = 3;
+            let lastError = null;
+            
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    log('INFO', `Navigation attempt ${attempt}/${maxRetries}`, this.accountId);
+                    responseError = null; // Reset error for this attempt
+                    
+                    // Try different wait strategies based on attempt
+                    const waitStrategy = attempt === 1 ? 'domcontentloaded' : 
+                                       attempt === 2 ? 'load' : 
+                                       'commit';
+                    
+                    const response = await this.page.goto(hiringUrl, {
+                        waitUntil: waitStrategy,
+                        timeout: this.config.timing.page_load_timeout
+                    });
+                    
+                    // Check response status
+                    if (response) {
+                        const status = response.status();
+                        log('INFO', `Navigation response status: ${status}`, this.accountId);
+                        
+                        if (status >= 400) {
+                            const errorMsg = `Page returned error status ${status}: ${response.statusText()}`;
+                            log('ERROR', errorMsg, this.accountId);
+                            throw new Error(errorMsg);
+                        }
+                    }
+                    
+                    // Check if responseError was set
+                    if (responseError) {
+                        throw new Error(`HTTP ${responseError.status} error: ${responseError.statusText}`);
+                    }
+                    
+                    // Wait a bit and check if page actually loaded
+                    await this.page.waitForTimeout(2000);
+                    const pageUrl = this.page.url();
+                    
+                    // Check for error messages in the page
+                    try {
+                        const pageText = await this.page.textContent('body').catch(() => '');
+                        if (pageText.toLowerCase().includes('page is not working') || 
+                            pageText.toLowerCase().includes('this site can\'t be reached') ||
+                            pageText.toLowerCase().includes('err_')) {
+                            log('ERROR', `Page shows error message. Attempt ${attempt}/${maxRetries}`, this.accountId);
+                            if (attempt < maxRetries) {
+                                log('INFO', 'Retrying navigation...', this.accountId);
+                                await this.page.waitForTimeout(3000); // Wait before retry
+                                continue;
+                            } else {
+                                throw new Error('Page is not working - connection or server error');
+                            }
+                        }
+                    } catch (checkError) {
+                        // If we can't check, continue anyway
+                        log('DEBUG', `Could not verify page content: ${checkError.message}`, this.accountId);
+                    }
+                    
+                    navigationSuccess = true;
+                    log('INFO', 'Navigation to hiring.amazon.ca completed successfully', this.accountId);
+                    break;
+                    
+                } catch (navError) {
+                    lastError = navError;
+                    log('WARNING', `Navigation attempt ${attempt} failed: ${navError.message}`, this.accountId);
+                    
+                    if (attempt < maxRetries) {
+                        log('INFO', `Retrying navigation (attempt ${attempt + 1}/${maxRetries})...`, this.accountId);
+                        await this.page.waitForTimeout(3000); // Wait before retry
+                    } else {
+                        // Last attempt failed, check page content for error messages
+                        try {
+                            const pageText = await this.page.textContent('body').catch(() => '');
+                            const currentUrl = this.page.url();
+                            
+                            log('INFO', `Current URL after failed navigation: ${currentUrl}`, this.accountId);
+                            
+                            // Check for common error messages in page
+                            const errorIndicators = [
+                                'page is not working',
+                                'this site can\'t be reached',
+                                'connection refused',
+                                'timeout',
+                                'error',
+                                'not available',
+                                '502',
+                                '503',
+                                '504'
+                            ];
+                            
+                            const lowerText = pageText.toLowerCase();
+                            for (const indicator of errorIndicators) {
+                                if (lowerText.includes(indicator)) {
+                                    log('ERROR', `Page contains error indicator: "${indicator}"`, this.accountId);
+                                    break;
+                                }
+                            }
+                            
+                            // Log page title for debugging
+                            const title = await this.page.title().catch(() => '');
+                            log('INFO', `Page title: ${title}`, this.accountId);
+                            
+                        } catch (contentError) {
+                            log('WARNING', `Could not check page content: ${contentError.message}`, this.accountId);
+                        }
+                    }
+                }
+            }
+            
+            // Remove response handler after navigation
+            this.page.off('response', responseHandler);
+            
+            // If navigation failed after all retries, throw error
+            if (!navigationSuccess) {
+                log('ERROR', `Navigation to hiring.amazon.ca failed after ${maxRetries} attempts`, this.accountId);
+                throw lastError || new Error('Navigation failed after all retries');
+            }
+            
+            // Wait for page to load
+            await this.page.waitForTimeout(2000);
+            
+            // Check if page actually loaded successfully
+            const pageUrl = this.page.url();
+            log('INFO', `Page loaded, current URL: ${pageUrl}`, this.accountId);
+            
+            // Verify we're on the right page
+            if (!pageUrl.includes('hiring.amazon.ca') && !pageUrl.includes('auth.hiring.amazon.com')) {
+                log('WARNING', `Unexpected URL after navigation: ${pageUrl}`, this.accountId);
+            }
+            
+            // Check for error messages in the page
+            try {
+                const pageText = await this.page.textContent('body').catch(() => '');
+                if (pageText.toLowerCase().includes('page is not working') || 
+                    pageText.toLowerCase().includes('this site can\'t be reached')) {
+                    log('ERROR', 'Page shows error message: "page is not working"', this.accountId);
+                    throw new Error('Page is not working - connection or server error');
+                }
+            } catch (checkError) {
+                // If we can't check, continue anyway
+                log('DEBUG', `Could not verify page content: ${checkError.message}`, this.accountId);
+            }
+            
+            // Find and click consent button if it exists - MUST be done before navigation
+            log('INFO', 'Step 1.5: Looking for consent button with id="consentBtn"...', this.accountId);
+            let consentButtonClicked = false;
+            let consentButtonFound = false;
+            
+            try {
+                // Wait for consent button to appear (with timeout)
+                try {
+                    await this.page.waitForSelector('#consentBtn', {
+                        timeout: 5000,
+                        state: 'attached'
+                    });
+                    consentButtonFound = true;
+                } catch (e) {
+                    log('DEBUG', 'Consent button not found in DOM (may not be present)', this.accountId);
+                }
+                
+                if (consentButtonFound) {
+                    // Try multiple times to click the consent button
+                    const maxConsentAttempts = 3;
+                    for (let attempt = 1; attempt <= maxConsentAttempts; attempt++) {
+                        try {
+                            const consentButton = await this.page.$('#consentBtn');
+                            if (consentButton) {
+                                const isVisible = await consentButton.isVisible();
+                                const isEnabled = await consentButton.isEnabled();
+                                log('INFO', `Consent button attempt ${attempt}/${maxConsentAttempts} - visible=${isVisible}, enabled=${isEnabled}`, this.accountId);
+                                
+                                if (isVisible && isEnabled) {
+                                    await consentButton.scrollIntoViewIfNeeded();
+                                    await this.page.waitForTimeout(500);
+                                    log('INFO', 'Clicking consent button...', this.accountId);
+                                    
+                                    // Try clicking with multiple methods
+                                    try {
+                                        await consentButton.click({ timeout: 5000 });
+                                    } catch (clickError) {
+                                        if (clickError.message.includes('intercepts') || clickError.message.includes('backdrop')) {
+                                            log('WARNING', 'Click blocked, trying force click...', this.accountId);
+                                            await consentButton.click({ force: true, timeout: 5000 });
+                                        } else {
+                                            throw clickError;
+                                        }
+                                    }
+                                    
+                                    // Wait for button to disappear or become hidden (indicating it was processed)
+                                    log('INFO', 'Waiting for consent button to be processed...', this.accountId);
+                                    await this.page.waitForTimeout(1000);
+                                    
+                                    // Verify consent button is gone or hidden
+                                    const consentButtonAfter = await this.page.$('#consentBtn');
+                                    if (consentButtonAfter) {
+                                        const stillVisible = await consentButtonAfter.isVisible();
+                                        if (!stillVisible) {
+                                            log('INFO', 'Consent button clicked successfully (button is now hidden)', this.accountId);
+                                            consentButtonClicked = true;
+                                            break;
+                                        } else {
+                                            log('WARNING', `Consent button still visible after click (attempt ${attempt})`, this.accountId);
+                                            if (attempt < maxConsentAttempts) {
+                                                await this.page.waitForTimeout(1000);
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        log('INFO', 'Consent button clicked successfully (button removed from DOM)', this.accountId);
+                                        consentButtonClicked = true;
+                                        break;
+                                    }
+                                } else {
+                                    if (!isVisible && !isEnabled) {
+                                        log('INFO', 'Consent button found but already processed (not visible/enabled)', this.accountId);
+                                        consentButtonClicked = true;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Button no longer exists - likely already clicked
+                                log('INFO', 'Consent button no longer exists (likely already processed)', this.accountId);
+                                consentButtonClicked = true;
+                                break;
+                            }
+                        } catch (attemptError) {
+                            log('WARNING', `Consent button click attempt ${attempt} failed: ${attemptError.message}`, this.accountId);
+                            if (attempt < maxConsentAttempts) {
+                                await this.page.waitForTimeout(1000);
+                            }
+                        }
+                    }
+                    
+                    if (!consentButtonClicked) {
+                        log('WARNING', 'Consent button was found but could not be clicked after all attempts', this.accountId);
+                        log('WARNING', 'Proceeding anyway, but navigation may fail if consent is required', this.accountId);
+                    }
+                } else {
+                    log('INFO', 'Consent button not found - may not be required for this page', this.accountId);
+                    consentButtonClicked = true; // No consent needed
+                }
+            } catch (consentError) {
+                log('WARNING', `Error handling consent button: ${consentError.message}`, this.accountId);
+                log('WARNING', 'Proceeding anyway, but navigation may fail if consent is required', this.accountId);
+            }
+            
+            // Wait additional time after consent to ensure page is ready
+            if (consentButtonClicked) {
+                log('INFO', 'Consent handled, waiting for page to be ready...', this.accountId);
+                await this.page.waitForTimeout(1000);
+            }
+            
+            // Handle location permission popup if it appears
+            log('INFO', 'Checking for location permission popup...', this.accountId);
+            try {
+                // Wait a bit for popup to appear
+                await this.page.waitForTimeout(1500);
+                
+                // Try multiple methods to dismiss the location popup
+                let popupDismissed = false;
+                
+                // Method 1: Look for "Never allow" button (most common)
+                try {
+                    const neverAllowButton = await this.page.$('button:has-text("Never allow")');
+                    if (neverAllowButton) {
+                        const isVisible = await neverAllowButton.isVisible();
+                        if (isVisible) {
+                            log('INFO', 'Found "Never allow" button, clicking...', this.accountId);
+                            await neverAllowButton.click();
+                            popupDismissed = true;
+                            await this.page.waitForTimeout(1000);
+                        }
+                    }
+                } catch (e) {
+                    log('DEBUG', 'Could not find "Never allow" button', this.accountId);
+                }
+                
+                // Method 2: Look for close button (X) in popup
+                if (!popupDismissed) {
+                    try {
+                        // Look for X button in various positions
+                        const closeButtons = await this.page.$$('button[aria-label*="close" i], button[aria-label*="dismiss" i], [role="button"][aria-label*="close" i]');
+                        for (const btn of closeButtons) {
+                            if (await btn.isVisible()) {
+                                log('INFO', 'Found close button, clicking...', this.accountId);
+                                await btn.click();
+                                popupDismissed = true;
+                                await this.page.waitForTimeout(1000);
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        log('DEBUG', 'Could not find close button', this.accountId);
+                    }
+                }
+                
+                // Method 3: Press Escape key
+                if (!popupDismissed) {
+                    try {
+                        log('INFO', 'Pressing Escape to dismiss popup...', this.accountId);
+                        await this.page.keyboard.press('Escape');
+                        await this.page.waitForTimeout(1000);
+                        popupDismissed = true;
+                    } catch (e) {
+                        log('DEBUG', 'Escape key did not work', this.accountId);
+                    }
+                }
+                
+                // Method 4: Click outside popup (click on a safe area like top navigation)
+                if (!popupDismissed) {
+                    try {
+                        log('INFO', 'Clicking outside popup area...', this.accountId);
+                        // Click on navigation bar area (should be safe)
+                        await this.page.click('body', { 
+                            position: { x: 500, y: 50 },
+                            force: true 
+                        });
+                        await this.page.waitForTimeout(1000);
+                    } catch (e) {
+                        log('DEBUG', 'Click outside did not work', this.accountId);
+                    }
+                }
+                
+                log('INFO', 'Location popup handling completed', this.accountId);
+            } catch (error) {
+                log('WARNING', `Error handling location popup: ${error.message}`, this.accountId);
+                // Continue anyway - popup might not be present or already dismissed
+            }
+            
+            // Additional wait to ensure popup is gone
+            await this.page.waitForTimeout(1000);
+            
+            // Step 2: Find and click "My Account" link with data-test-id="topPanelMyAccountLink"
+            log('INFO', 'Step 2: Looking for topPanelMyAccountLink', this.accountId);
+            try {
+                await this.page.waitForSelector('[data-test-id="topPanelMyAccountLink"]', {
+                    timeout: 15000,
+                    state: 'visible'
+                });
+                log('INFO', 'topPanelMyAccountLink found, clicking...', this.accountId);
+                await this.page.click('[data-test-id="topPanelMyAccountLink"]');
+                log('INFO', 'topPanelMyAccountLink clicked', this.accountId);
+                await this.page.waitForTimeout(1000);
+            } catch (error) {
+                log('ERROR', `Failed to find/click topPanelMyAccountLink: ${error.message}`, this.accountId);
+                throw new Error(`Could not click My Account link: ${error.message}`);
+            }
+            
+            // Step 3: Find and click "Sign In" link with data-test-id="topPanelSigninLink"
+            log('INFO', 'Step 3: Looking for topPanelSigninLink', this.accountId);
+            try {
+                await this.page.waitForSelector('[data-test-id="topPanelSigninLink"]', {
+                    timeout: 15000,
+                    state: 'visible'
+                });
+                log('INFO', 'topPanelSigninLink found, clicking...', this.accountId);
+                await this.page.click('[data-test-id="topPanelSigninLink"]');
+                log('INFO', 'topPanelSigninLink clicked', this.accountId);
+                await this.page.waitForTimeout(2000);
+                
+                // Wait for navigation to login page
+                log('INFO', 'Waiting for navigation to login page...', this.accountId);
+                await this.page.waitForNavigation({
+                    waitUntil: 'networkidle',
+                    timeout: 15000
+                }).catch(() => {
+                    // Navigation might already be complete
+                    log('INFO', 'Navigation may have already completed', this.accountId);
+                });
+                
+                log('INFO', 'Current URL after sign in click: ' + this.page.url(), this.accountId);
+            } catch (error) {
+                log('ERROR', `Failed to find/click topPanelSigninLink: ${error.message}`, this.accountId);
+                throw new Error(`Could not click Sign In link: ${error.message}`);
+            }
+            
+            // Step 4: Verify we're on the login page, if not navigate directly
+            const currentUrl = this.page.url();
+            if (!currentUrl.includes('auth.hiring.amazon.com') && !currentUrl.includes('/login')) {
+                log('WARNING', `Not on login page (${currentUrl}), navigating directly...`, this.accountId);
+                const loginUrl = 'https://auth.hiring.amazon.com/#/login';
+                await this.page.goto(loginUrl, {
+                    waitUntil: 'networkidle',
+                    timeout: this.config.timing.page_load_timeout
+                });
+                log('INFO', 'Direct navigation to login page completed', this.accountId);
+            } else {
+                log('INFO', 'Already on login page', this.accountId);
+            }
+
+            // Wait for page to fully load
+            log('INFO', 'Waiting for page to stabilize...', this.accountId);
+            await this.page.waitForTimeout(2000);
+            log('INFO', 'Page loaded, current URL: ' + this.page.url(), this.accountId);
+
+            // Find email input with id="login" and name="login EmailId"
+            log('INFO', 'Looking for email input (id="login", name="login EmailId")', this.accountId);
+            let emailSelector = '#login[name="login EmailId"]';
+            
+            try {
+                await this.page.waitForSelector(emailSelector, {
+                    timeout: 15000,
+                    state: 'visible'
+                });
+                log('INFO', 'Email input found with primary selector', this.accountId);
+            } catch (error) {
+                // Try alternative selectors if the specific one doesn't work
+                log('WARNING', 'Primary email selector not found, trying alternatives', this.accountId);
+                const altSelectors = [
+                    '#login',
+                    'input[name="login EmailId"]',
+                    'input#login',
+                    ...this.config.selectors.email_field.split(',').map(s => s.trim())
+                ];
+                
+                let found = false;
+                for (const selector of altSelectors) {
+                    try {
+                        await this.page.waitForSelector(selector, { timeout: 3000, state: 'visible' });
+                        emailSelector = selector;
+                        found = true;
+                        log('INFO', `Using alternative email selector: ${selector}`, this.accountId);
+                        break;
+                    } catch (e) {
+                        log('DEBUG', `Selector ${selector} not found, trying next...`, this.accountId);
+                        continue;
+                    }
+                }
+                
+                if (!found) {
+                    log('ERROR', 'Email input field not found after trying all selectors', this.accountId);
+                    log('ERROR', `Tried selectors: ${emailSelector}, ${altSelectors.join(', ')}`, this.accountId);
+                    throw new Error('Email input field not found');
+                }
+            }
+
+            // Fill email
+            log('INFO', `Email selector found: ${emailSelector}`, this.accountId);
+            log('INFO', `Filling email: ${this.account.email}`, this.accountId);
+            await this.page.fill(emailSelector, this.account.email);
+            log('INFO', 'Email filled successfully', this.accountId);
+            await this.page.waitForTimeout(this.config.timing.action_delay);
+
+            // Click continue button after email - find within #pageRouter element
+            // Use specific selector: data-test-id="button-continue" with class "e4s171p0 css-gehx51"
+            log('INFO', 'Looking for continue button within #pageRouter element', this.accountId);
+            
+            let continueButtonClicked = false;
+            
+            // Wait for pageRouter element to be present first
+            try {
+                await this.page.waitForSelector('#pageRouter', {
+                    timeout: 10000,
+                    state: 'attached'
+                });
+                log('INFO', '#pageRouter element found', this.accountId);
+            } catch (error) {
+                log('WARNING', `#pageRouter element not found: ${error.message}`, this.accountId);
+            }
+            
+            // Wait a bit for any modals/backdrops to settle
+            await this.page.waitForTimeout(1000);
+            
+            // Try to dismiss any modal backdrop that might be blocking
+            try {
+                const backdrop = await this.page.$('[data-test-component="StencilModalBackdrop"]');
+                if (backdrop) {
+                    log('INFO', 'Modal backdrop detected, attempting to dismiss...', this.accountId);
+                    // Try clicking outside or pressing Escape
+                    await this.page.keyboard.press('Escape');
+                    await this.page.waitForTimeout(500);
+                }
+            } catch (e) {
+                // Ignore if backdrop not found
+            }
+            
+            // Try multiple selector strategies
+            const selectors = [
+                '#pageRouter button[data-test-id="button-continue"].e4s171p0.css-gehx51',
+                '#pageRouter button[data-test-id="button-continue"][class*="e4s171p0"][class*="css-gehx51"]',
+                '#pageRouter button[data-test-id="button-continue"]',
+                'button[data-test-id="button-continue"].e4s171p0.css-gehx51',
+                'button[data-test-id="button-continue"][class*="e4s171p0"][class*="css-gehx51"]',
+                'button[data-test-id="button-continue"]'
+            ];
+            
+            for (const selector of selectors) {
+                if (continueButtonClicked) break;
+                
+                try {
+                    log('INFO', `Trying selector: ${selector}`, this.accountId);
+                    
+                    await this.page.waitForSelector(selector, {
+                        timeout: 5000,
+                        state: 'visible'
+                    });
+                    
+                    const button = await this.page.$(selector);
+                    if (button) {
+                        // Scroll button into view
+                        await button.scrollIntoViewIfNeeded();
+                        await this.page.waitForTimeout(500);
+                        
+                        // Check if button is enabled and visible
+                        const isEnabled = await button.isEnabled();
+                        const isVisible = await button.isVisible();
+                        log('INFO', `Button found - enabled=${isEnabled}, visible=${isVisible}`, this.accountId);
+                        
+                        if (isEnabled && isVisible) {
+                            // Try normal click first
+                            try {
+                                log('INFO', 'Attempting normal click...', this.accountId);
+                                await button.click({ timeout: 3000 });
+                                log('INFO', 'Continue button clicked successfully', this.accountId);
+                                continueButtonClicked = true;
+                                break;
+                            } catch (clickError) {
+                                // If normal click fails due to backdrop, try force click
+                                if (clickError.message.includes('intercepts pointer events') || 
+                                    clickError.message.includes('backdrop')) {
+                                    log('WARNING', 'Normal click blocked by backdrop, trying force click...', this.accountId);
+                                    try {
+                                        await button.click({ force: true, timeout: 3000 });
+                                        log('INFO', 'Continue button clicked with force', this.accountId);
+                                        continueButtonClicked = true;
+                                        break;
+                                    } catch (forceError) {
+                                        log('WARNING', `Force click also failed: ${forceError.message}`, this.accountId);
+                                    }
+                                } else {
+                                    throw clickError;
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    log('DEBUG', `Selector ${selector} failed: ${error.message}`, this.accountId);
+                    continue;
+                }
+            }
+            
+            // If still not clicked, try JavaScript click as last resort
+            if (!continueButtonClicked) {
+                try {
+                    log('INFO', 'Trying JavaScript click as last resort...', this.accountId);
+                    await this.page.evaluate(() => {
+                        const button = document.querySelector('#pageRouter button[data-test-id="button-continue"]') ||
+                                     document.querySelector('button[data-test-id="button-continue"]');
+                        if (button) {
+                            button.click();
+                            return true;
+                        }
+                        return false;
+                    });
+                    log('INFO', 'JavaScript click executed', this.accountId);
+                    continueButtonClicked = true;
+                    await this.page.waitForTimeout(1000);
+                } catch (jsError) {
+                    log('WARNING', `JavaScript click failed: ${jsError.message}`, this.accountId);
+                }
+            }
+            
+            if (continueButtonClicked) {
+                await this.page.waitForTimeout(this.config.timing.action_delay);
+            } else {
+                log('WARNING', 'Continue button not clicked, proceeding to PIN field anyway...', this.accountId);
+            }
+
+            // Wait for PIN field to appear after clicking continue (page doesn't refresh, components change)
+            log('INFO', 'Waiting for PIN field to appear (components are changing)...', this.accountId);
+            await this.page.waitForTimeout(2000);
+            
+            // Find PIN input with id="pin" and name="pin"
+            log('INFO', 'Looking for PIN input with id="pin" and name="pin"', this.accountId);
+            let pinSelector = '#pin[name="pin"]';
+            let pinFound = false;
+            
+            try {
+                await this.page.waitForSelector(pinSelector, {
+                    timeout: 15000,
+                    state: 'visible'
+                });
+                log('INFO', 'PIN input found with primary selector', this.accountId);
+                pinFound = true;
+            } catch (error) {
+                log('WARNING', 'Primary PIN selector not found, trying alternatives', this.accountId);
+                // Try alternative selectors
+                const altPinSelectors = [
+                    '#pin',
+                    'input[name="pin"]',
+                    'input#pin',
+                    ...this.config.selectors.pin_field.split(',').map(s => s.trim())
+                ];
+                
+                for (const selector of altPinSelectors) {
+                    try {
+                        await this.page.waitForSelector(selector, { timeout: 3000, state: 'visible' });
+                        pinSelector = selector;
+                        pinFound = true;
+                        log('INFO', `Using alternative PIN selector: ${selector}`, this.accountId);
+                        break;
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            }
+            
+            if (!pinFound) {
+                log('ERROR', 'PIN input field not found after trying all selectors', this.accountId);
+                throw new Error('PIN input field not found');
+            }
+
+            // Fill PIN
+            log('INFO', `PIN selector found: ${pinSelector}`, this.accountId);
+            log('INFO', `Filling PIN: ${this.account.pin}`, this.accountId);
+            await this.page.fill(pinSelector, this.account.pin);
+            log('INFO', 'PIN filled successfully', this.accountId);
+            await this.page.waitForTimeout(this.config.timing.action_delay);
+            
+            // Find and click continue button again (for PIN submission)
+            // Button has class "e4s171p0 gehx51" and data-test-id "button-continue"
+            log('INFO', 'Looking for continue button after PIN entry (class "e4s171p0 gehx51")', this.accountId);
+            let pinContinueButtonClicked = false;
+            
+            // Wait a bit for button to be ready
+            await this.page.waitForTimeout(500);
+            
+            // Try multiple selector strategies for the PIN continue button
+            const pinContinueSelectors = [
+                '#pageRouter button[data-test-id="button-continue"].e4s171p0.gehx51',
+                '#pageRouter button[data-test-id="button-continue"][class*="e4s171p0"][class*="gehx51"]',
+                'button[data-test-id="button-continue"].e4s171p0.gehx51',
+                'button[data-test-id="button-continue"][class*="e4s171p0"][class*="gehx51"]',
+                '#pageRouter button[data-test-id="button-continue"]',
+                'button[data-test-id="button-continue"]'
+            ];
+            
+            for (const selector of pinContinueSelectors) {
+                if (pinContinueButtonClicked) break;
+                
+                try {
+                    log('INFO', `Trying PIN continue button selector: ${selector}`, this.accountId);
+                    
+                    await this.page.waitForSelector(selector, {
+                        timeout: 5000,
+                        state: 'visible'
+                    });
+                    
+                    const button = await this.page.$(selector);
+                    if (button) {
+                        await button.scrollIntoViewIfNeeded();
+                        await this.page.waitForTimeout(500);
+                        
+                        const isEnabled = await button.isEnabled();
+                        const isVisible = await button.isVisible();
+                        log('INFO', `PIN continue button found - enabled=${isEnabled}, visible=${isVisible}`, this.accountId);
+                        
+                        if (isEnabled && isVisible) {
+                            try {
+                                log('INFO', 'Clicking PIN continue button...', this.accountId);
+                                await button.click({ timeout: 5000 });
+                                log('INFO', 'PIN continue button clicked successfully', this.accountId);
+                                pinContinueButtonClicked = true;
+                                break;
+                            } catch (clickError) {
+                                if (clickError.message.includes('intercepts pointer events') || 
+                                    clickError.message.includes('backdrop')) {
+                                    log('WARNING', 'Click blocked, trying force click...', this.accountId);
+                                    await button.click({ force: true, timeout: 5000 });
+                                    log('INFO', 'PIN continue button clicked with force', this.accountId);
+                                    pinContinueButtonClicked = true;
+                                    break;
+                                } else {
+                                    throw clickError;
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    log('DEBUG', `PIN continue selector ${selector} failed: ${error.message}`, this.accountId);
+                    continue;
+                }
+            }
+            
+            // JavaScript click as fallback
+            if (!pinContinueButtonClicked) {
+                try {
+                    log('INFO', 'Trying JavaScript click for PIN continue button...', this.accountId);
+                    await this.page.evaluate(() => {
+                        const button = document.querySelector('#pageRouter button[data-test-id="button-continue"]') ||
+                                     document.querySelector('button[data-test-id="button-continue"]');
+                        if (button) {
+                            button.click();
+                            return true;
+                        }
+                        return false;
+                    });
+                    log('INFO', 'PIN continue button clicked via JavaScript', this.accountId);
+                    pinContinueButtonClicked = true;
+                    await this.page.waitForTimeout(1000);
+                } catch (jsError) {
+                    log('WARNING', `JavaScript click for PIN continue failed: ${jsError.message}`, this.accountId);
+                }
+            }
+            
+            if (pinContinueButtonClicked) {
+                await this.page.waitForTimeout(this.config.timing.action_delay);
+                
+                // Wait for components to change (no page refresh, but different components shown)
+                log('INFO', 'Waiting for components to change after PIN continue...', this.accountId);
+                await this.page.waitForTimeout(2000);
+            } else {
+                log('WARNING', 'PIN continue button not clicked', this.accountId);
+            }
+
+            // Find and click button with aria-describedby="send_code_hint"
+            // This appears after PIN continue button is clicked
+            log('INFO', 'Looking for button with aria-describedby="send_code_hint"', this.accountId);
+            let sendCodeButtonClicked = false;
+            
+            try {
+                const sendCodeButtonSelector = 'button[aria-describedby="send_code_hint"]';
+                
+                await this.page.waitForSelector(sendCodeButtonSelector, {
+                    timeout: 10000,
+                    state: 'visible'
+                });
+                
+                const sendCodeButton = await this.page.$(sendCodeButtonSelector);
+                if (sendCodeButton) {
+                    await sendCodeButton.scrollIntoViewIfNeeded();
+                    await this.page.waitForTimeout(500);
+                    
+                    const isEnabled = await sendCodeButton.isEnabled();
+                    const isVisible = await sendCodeButton.isVisible();
+                    log('INFO', `Send code button found - enabled=${isEnabled}, visible=${isVisible}`, this.accountId);
+                    
+                    if (isEnabled && isVisible) {
+                        try {
+                            // Wait for aws-waf-token cookie (critical for WAF to allow the POST)
+                            log('INFO', 'Waiting for aws-waf-token cookie...', this.accountId);
+                            const wafTokenReady = await this._waitForWafToken(10000);
+                            if (!wafTokenReady) {
+                                log('WARNING', 'aws-waf-token not found, proceeding anyway', this.accountId);
+                            }
+
+                            // Wait for network to be idle (WAF challenges must complete)
+                            try {
+                                await this.page.waitForLoadState('networkidle', { timeout: 5000 });
+                            } catch (e) {
+                                log('DEBUG', 'Network idle timeout, continuing', this.accountId);
+                            }
+
+                            // Human-like delay before clicking
+                            await this.page.waitForTimeout(1000 + Math.random() * 1000);
+
+                            // Move mouse to button like a human would
+                            try {
+                                const box = await sendCodeButton.boundingBox();
+                                if (box) {
+                                    await this.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                                    await this.page.waitForTimeout(200 + Math.random() * 300);
+                                }
+                            } catch (e) {
+                                // Ignore mouse move errors
+                            }
+
+                            // Log cookie count for debugging
+                            const finalCookies = await this.context.cookies();
+                            log('INFO', `Cookie count before click: ${finalCookies.length}`, this.accountId);
+                            const wafCookie = finalCookies.find(c => c.name === 'aws-waf-token');
+                            log('INFO', `aws-waf-token present: ${!!wafCookie}`, this.accountId);
+
+                            log('INFO', 'Clicking send code button...', this.accountId);
+                            await sendCodeButton.click({ timeout: 5000 });
+
+                            // Wait for the POST response
+                            await this.page.waitForTimeout(3000);
+                            sendCodeButtonClicked = true;
+                        } catch (clickError) {
+                            if (clickError.message.includes('intercepts pointer events') || 
+                                clickError.message.includes('backdrop')) {
+                                log('WARNING', 'Click blocked, trying force click...', this.accountId);
+                                await sendCodeButton.click({ force: true, timeout: 5000 });
+                                log('INFO', 'Send code button clicked with force', this.accountId);
+                                sendCodeButtonClicked = true;
+                            } else {
+                                throw clickError;
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                log('WARNING', `Send code button not found or click failed: ${error.message}`, this.accountId);
+                
+                // Try JavaScript click as fallback
+                try {
+                    log('INFO', 'Trying JavaScript click for send code button...', this.accountId);
+                    await this.page.evaluate(() => {
+                        const button = document.querySelector('button[aria-describedby="send_code_hint"]');
+                        if (button) {
+                            button.click();
+                            return true;
+                        }
+                        return false;
+                    });
+                    log('INFO', 'Send code button clicked via JavaScript', this.accountId);
+                    sendCodeButtonClicked = true;
+                    await this.page.waitForTimeout(1000);
+                } catch (jsError) {
+                    log('WARNING', `JavaScript click for send code button failed: ${jsError.message}`, this.accountId);
+                }
+            }
+            
+            if (sendCodeButtonClicked) {
+                await this.page.waitForTimeout(this.config.timing.action_delay);
+                log('INFO', 'Waiting for captcha modal to appear...', this.accountId);
+                await this.page.waitForTimeout(2000);
+            } else {
+                log('WARNING', 'Send code button not clicked, proceeding anyway...', this.accountId);
+            }
+
+            // Handle captcha modal - wait for modal with id "captchaModal" to appear
+            log('INFO', 'Looking for captcha modal with id="captchaModal"', this.accountId);
+            let captchaModalFound = false;
+            let captchaAudioButtonClicked = false;
+            
+            try {
+                // First check if modal exists in DOM (might be hidden initially)
+                await this.page.waitForSelector('#captchaModal', {
+                    timeout: 15000,
+                    state: 'attached'
+                });
+                log('INFO', 'Captcha modal element found in DOM', this.accountId);
+                
+                // Wait for it to become visible
+                try {
+                    await this.page.waitForSelector('#captchaModal', {
+                        timeout: 10000,
+                        state: 'visible'
+                    });
+                    log('INFO', 'Captcha modal is now visible', this.accountId);
+                    captchaModalFound = true;
+                } catch (visibilityError) {
+                    // Modal exists but might be hidden - try to make it visible or wait longer
+                    log('WARNING', 'Captcha modal exists but not visible, waiting longer...', this.accountId);
+                    await this.page.waitForTimeout(2000);
+                    
+                    // Check if it's visible now
+                    const modal = await this.page.$('#captchaModal');
+                    if (modal) {
+                        const isVisible = await modal.isVisible();
+                        if (isVisible) {
+                            log('INFO', 'Captcha modal became visible after wait', this.accountId);
+                            captchaModalFound = true;
+                        } else {
+                            log('WARNING', 'Captcha modal still hidden, trying to interact anyway', this.accountId);
+                            captchaModalFound = true; // Try anyway
+                        }
+                    }
+                }
+                
+                // Wait a bit for modal content to fully load
+                await this.page.waitForTimeout(1000);
+                
+                // Find and click button with id "amzn-btn-audio-internal" within the modal
+                log('INFO', 'Looking for captcha audio button with id="amzn-btn-audio-internal" in modal', this.accountId);
+                
+                try {
+                    // Try finding within the modal first
+                    const captchaButtonSelector = '#captchaModal #amzn-btn-audio-internal';
+                    await this.page.waitForSelector(captchaButtonSelector, {
+                        timeout: 10000,
+                        state: 'visible'
+                    });
+                    
+                    const captchaButton = await this.page.$(captchaButtonSelector);
+                    if (captchaButton) {
+                        await captchaButton.scrollIntoViewIfNeeded();
+                        await this.page.waitForTimeout(500);
+                        
+                        const isEnabled = await captchaButton.isEnabled();
+                        const isVisible = await captchaButton.isVisible();
+                        log('INFO', `Captcha audio button found - enabled=${isEnabled}, visible=${isVisible}`, this.accountId);
+                        
+                        if (isEnabled && isVisible) {
+                            try {
+                                log('INFO', 'Clicking captcha audio button...', this.accountId);
+                                await captchaButton.click({ timeout: 5000 });
+                                log('INFO', 'Captcha audio button clicked successfully', this.accountId);
+                                captchaAudioButtonClicked = true;
+                            } catch (clickError) {
+                                if (clickError.message.includes('intercepts pointer events') || 
+                                    clickError.message.includes('backdrop')) {
+                                    log('WARNING', 'Click blocked, trying force click...', this.accountId);
+                                    await captchaButton.click({ force: true, timeout: 5000 });
+                                    log('INFO', 'Captcha audio button clicked with force', this.accountId);
+                                    captchaAudioButtonClicked = true;
+                                } else {
+                                    throw clickError;
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    log('WARNING', `Captcha audio button not found in modal: ${error.message}`, this.accountId);
+                    
+                    // Try without modal scope (button might be outside modal structure)
+                    try {
+                        log('INFO', 'Trying to find button without modal scope...', this.accountId);
+                        const globalButtonSelector = '#amzn-btn-audio-internal';
+                        await this.page.waitForSelector(globalButtonSelector, {
+                            timeout: 5000,
+                            state: 'visible'
+                        });
+                        
+                        const globalButton = await this.page.$(globalButtonSelector);
+                        if (globalButton) {
+                            await globalButton.scrollIntoViewIfNeeded();
+                            await this.page.waitForTimeout(500);
+                            
+                            const isEnabled = await globalButton.isEnabled();
+                            const isVisible = await globalButton.isVisible();
+                            log('INFO', `Captcha audio button found (global) - enabled=${isEnabled}, visible=${isVisible}`, this.accountId);
+                            
+                            if (isEnabled && isVisible) {
+                                try {
+                                    log('INFO', 'Clicking captcha audio button (global)...', this.accountId);
+                                    await globalButton.click({ timeout: 5000 });
+                                    log('INFO', 'Captcha audio button clicked successfully', this.accountId);
+                                    captchaAudioButtonClicked = true;
+                                } catch (clickError) {
+                                    if (clickError.message.includes('intercepts pointer events') || 
+                                        clickError.message.includes('backdrop')) {
+                                        log('WARNING', 'Click blocked, trying force click...', this.accountId);
+                                        await globalButton.click({ force: true, timeout: 5000 });
+                                        log('INFO', 'Captcha audio button clicked with force', this.accountId);
+                                        captchaAudioButtonClicked = true;
+                                    } else {
+                                        throw clickError;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (globalError) {
+                        log('WARNING', `Global captcha button search also failed: ${globalError.message}`, this.accountId);
+                    }
+                }
+                
+                // JavaScript click as fallback
+                if (!captchaAudioButtonClicked) {
+                    try {
+                        log('INFO', 'Trying JavaScript click for captcha audio button...', this.accountId);
+                        const clicked = await this.page.evaluate(() => {
+                            // Try within modal first
+                            const modal = document.querySelector('#captchaModal');
+                            if (modal) {
+                                const button = modal.querySelector('#amzn-btn-audio-internal');
+                                if (button) {
+                                    button.click();
+                                    return true;
+                                }
+                            }
+                            // Try globally
+                            const globalButton = document.querySelector('#amzn-btn-audio-internal');
+                            if (globalButton) {
+                                globalButton.click();
+                                return true;
+                            }
+                            return false;
+                        });
+                        
+                        if (clicked) {
+                            log('INFO', 'Captcha audio button clicked via JavaScript', this.accountId);
+                            captchaAudioButtonClicked = true;
+                            await this.page.waitForTimeout(1000);
+                        } else {
+                            log('WARNING', 'Captcha audio button not found in DOM', this.accountId);
+                        }
+                    } catch (jsError) {
+                        log('WARNING', `JavaScript click for captcha audio button failed: ${jsError.message}`, this.accountId);
+                    }
+                }
+                
+            } catch (error) {
+                log('WARNING', `Captcha modal not found or error: ${error.message}`, this.accountId);
+                log('INFO', 'Proceeding without captcha handling...', this.accountId);
+            }
+            
+            if (captchaAudioButtonClicked) {
+                await this.page.waitForTimeout(this.config.timing.action_delay);
+                log('INFO', 'Waiting for captcha audio to process...', this.accountId);
+                await this.page.waitForTimeout(2000);
+            } else if (captchaModalFound) {
+                log('WARNING', 'Captcha modal found but audio button not clicked', this.accountId);
+            }
+
+            // Find and click final login/submit button
+            // After send code button, look for the submit button (might be StencilReactButton or another button)
+            log('INFO', 'Looking for final login/submit button', this.accountId);
+            let loginButtonSelector;
+            let loginButtonClicked = false;
+            
+            // Try to find StencilReactButton that is visible and enabled (should be the submit button after PIN)
+            try {
+                // Wait a bit for the button to be ready
+                await this.page.waitForTimeout(500);
+                
+                // Get all StencilReactButton elements
+                const buttons = await this.page.$$('button[data-test-component="StencilReactButton"]');
+                log('INFO', `Found ${buttons.length} StencilReactButton(s) on page`, this.accountId);
+                
+                // Find the one that is visible and enabled (likely the submit button)
+                for (let i = 0; i < buttons.length; i++) {
+                    const isVisible = await buttons[i].isVisible();
+                    const isEnabled = await buttons[i].isEnabled();
+                    log('DEBUG', `Button ${i + 1}: visible=${isVisible}, enabled=${isEnabled}`, this.accountId);
+                    
+                    if (isVisible && isEnabled) {
+                        // This is likely the submit button
+                        log('INFO', `Clicking StencilReactButton ${i + 1} as submit button`, this.accountId);
+                        await buttons[i].click();
+                        loginButtonClicked = true;
+                        break;
+                    }
+                }
+            } catch (error) {
+                log('WARNING', `Error finding StencilReactButton: ${error.message}`, this.accountId);
+            }
+            
+            // If StencilReactButton wasn't clicked, try alternative selectors
+            if (!loginButtonClicked) {
+                try {
+                    loginButtonSelector = await this._findSelector(this.config.selectors.login_button, 10000);
+                    log('INFO', `Using alternative login button selector: ${loginButtonSelector}`, this.accountId);
+                    await this.page.click(loginButtonSelector);
+                    loginButtonClicked = true;
+                } catch (error) {
+                    log('ERROR', `Failed to click login button: ${error.message}`, this.accountId);
+                    throw new Error('Login button not found or not clickable');
+                }
+            }
+
+            // Wait for login to complete
+            try {
+                await this.page.waitForSelector(this.config.selectors.logged_in_indicator, {
+                    timeout: 15000
+                });
+                log('INFO', 'Login successful', this.accountId);
+                this.lastLoginTime = new Date();
+                return true;
+            } catch (error) {
+                const currentUrl = this.page.url();
+                if (currentUrl.toLowerCase().includes('login')) {
+                    log('ERROR', 'Login failed - still on login page', this.accountId);
+                    return false;
+                }
+                log('INFO', 'Login appears successful (redirected)', this.accountId);
+                this.lastLoginTime = new Date();
+                return true;
+            }
+        } catch (error) {
+            log('ERROR', `Login error: ${error.message}`, this.accountId);
+            return false;
+        }
+    }
+
+    async checkLoggedIn() {
+        try {
+            // Check if page exists
+            if (!this.page) {
+                log('WARNING', 'Page not initialized, assuming not logged in', this.accountId);
+                return false;
+            }
+
+            // Check for logged in indicator
+            try {
+                const indicator = await this.page.$(this.config.selectors.logged_in_indicator);
+                if (indicator) {
+                    log('DEBUG', 'Logged in indicator found', this.accountId);
+                    return true;
+                }
+            } catch (error) {
+                log('DEBUG', `Could not find logged in indicator: ${error.message}`, this.accountId);
+            }
+
+            // Check URL
+            try {
+                const currentUrl = this.page.url();
+                log('DEBUG', `Current URL: ${currentUrl}`, this.accountId);
+                if (currentUrl.toLowerCase().includes('login')) {
+                    log('DEBUG', 'Still on login page, not logged in', this.accountId);
+                    return false;
+                }
+                // If not on login page, might be logged in
+                log('DEBUG', 'Not on login page, might be logged in', this.accountId);
+                return false; // Default to false to force login attempt
+            } catch (error) {
+                log('WARNING', `Error checking URL: ${error.message}`, this.accountId);
+                return false;
+            }
+        } catch (error) {
+            log('WARNING', `Error in checkLoggedIn: ${error.message}`, this.accountId);
+            return false; // Default to false to force login attempt
+        }
+    }
+
+    async runCycle() {
+        try {
+            // Ensure page is initialized
+            if (!this.page) {
+                log('ERROR', 'Page not initialized, cannot run cycle', this.accountId);
+                return false;
+            }
+
+            log('INFO', 'Starting runCycle', this.accountId);
+            const isLoggedIn = await this.checkLoggedIn();
+            log('INFO', `Login status check: ${isLoggedIn}`, this.accountId);
+
+            if (!isLoggedIn) {
+                log('INFO', 'Not logged in, performing login...', this.accountId);
+                const result = await this.login();
+                log('INFO', `Login result: ${result}`, this.accountId);
+                return result;
+            } else {
+                log('INFO', 'Already logged in, refreshing session...', this.accountId);
+                await this.page.reload({ waitUntil: 'networkidle' });
+                return true;
+            }
+        } catch (error) {
+            log('ERROR', `Cycle error: ${error.message}`, this.accountId);
+            log('ERROR', `Stack trace: ${error.stack}`, this.accountId);
+            return false;
+        }
+    }
+
+    async logout() {
+        try {
+            const logoutBtn = await this.page.$(this.config.selectors.logout_button);
+            if (logoutBtn) {
+                await logoutBtn.click();
+                await this.page.waitForTimeout(2000);
+            }
+        } catch (error) {
+            // Ignore logout errors
+        }
+    }
+
+    async cleanup() {
+        try {
+            if (this.page) {
+                await this.logout();
+            }
+            if (this.context) {
+                await this.context.close();
+            }
+        } catch (error) {
+            log('ERROR', `Cleanup error: ${error.message}`, this.accountId);
+        }
+    }
+}
+
+// Multi-account manager
+class AutoLoginManager {
+    constructor(configPath = 'config.json') {
+        this.configPath = configPath;
+        this.config = this._loadConfig(configPath);
+        this.browser = null;
+        this.accounts = [];
+        this.proxies = this._loadProxies();
+        this.startTime = new Date();
+        this.maxRuntime = this.config.timing.max_runtime_hours * 60 * 60 * 1000;
+        this.watcher = null;
+        this.shouldRestart = false;
+        this.isRunning = false;
+        this.concurrentLimit = this.config.timing.concurrent_limit || 10; // Process 10 accounts at a time
+    }
+    
+    _loadProxies() {
+        try {
+            const proxiesPath = 'proxies.json';
+            if (fs.existsSync(proxiesPath)) {
+                const proxiesData = fs.readFileSync(proxiesPath, 'utf8');
+                const proxies = JSON.parse(proxiesData);
+                log('INFO', `Loaded ${proxies.length} proxies from ${proxiesPath}`);
+                return proxies;
+            } else {
+                log('WARNING', `Proxies file ${proxiesPath} not found. Running without proxies.`);
+                return [];
+            }
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                log('WARNING', 'Proxies file not found. Running without proxies.');
+                return [];
+            } else if (error instanceof SyntaxError) {
+                log('ERROR', `Invalid JSON in proxies file: ${error.message}`);
+                return [];
+            } else {
+                log('ERROR', `Error loading proxies: ${error.message}`);
+                return [];
+            }
+        }
+    }
+
+    _loadConfig(configPath) {
+        try {
+            const configData = fs.readFileSync(configPath, 'utf8');
+            const config = JSON.parse(configData);
+            log('INFO', `Configuration loaded from ${configPath}`);
+
+            // Support both single account (legacy) and multiple accounts
+            if (config.accounts && Array.isArray(config.accounts)) {
+                log('INFO', `Found ${config.accounts.length} accounts in configuration`);
+            } else if (config.website && config.website.email) {
+                // Convert single account to array format
+                config.accounts = [{
+                    email: config.website.email,
+                    pin: config.website.pin
+                }];
+                log('INFO', 'Converted single account format to array format');
+            }
+
+            // Override with environment variables if present
+            if (process.env.LOGIN_URL) {
+                config.website.url = process.env.LOGIN_URL;
+            }
+
+            return config;
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                log('ERROR', `Configuration file ${configPath} not found`);
+                throw error;
+            } else if (error instanceof SyntaxError) {
+                log('ERROR', `Invalid JSON in configuration file: ${error.message}`);
+                throw error;
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    async initBrowser() {
+        // Auto-detect dev mode: check for nodemon in process title or NODE_ENV
+        // When running via "npm run dev", nodemon will be in the process title
+        const isDevMode = process.title.toLowerCase().includes('nodemon') ||
+                         process.env.NODE_ENV === 'development' ||
+                         process.env.npm_lifecycle_event === 'dev';
+        
+        // Default to non-headless (headless: false) to avoid bot detection
+        // Many sites flag headless browsers. Set HEADLESS=true to enable headless mode.
+        // For testing, always use headless: false to verify behavior
+        const headless = process.env.HEADLESS === 'true';
+        
+        // Check if browser is installed using Playwright's chromium executablePath
+        try {
+            const executablePath = chromium.executablePath();
+            if (!executablePath || !fs.existsSync(executablePath)) {
+                throw new Error('Browser executable not found');
+            }
+        } catch (error) {
+            log('ERROR', 'Playwright browser not found. Please install browsers first.');
+            log('ERROR', 'Run: npm run install-browsers');
+            log('ERROR', 'Or: npx playwright install chromium');
+            throw new Error('Playwright browsers not installed. Run "npm run install-browsers" to install them.');
+        }
+        
+        try {
+            this.browser = await chromium.launch({
+                headless: headless,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=IsolateOrigins,site-per-process'
+                ]
+            });
+            log('INFO', `Browser initialized (headless: ${headless}${isDevMode ? ', dev mode' : ''})`);
+        } catch (error) {
+            if (error.message.includes('Executable doesn\'t exist') || error.message.includes('executable')) {
+                log('ERROR', 'Playwright browser not found. Please install browsers first.');
+                log('ERROR', 'Run: npm run install-browsers');
+                log('ERROR', 'Or: npx playwright install chromium');
+                throw new Error('Playwright browsers not installed. Run "npm run install-browsers" to install them.');
+            }
+            throw error;
+        }
+    }
+
+    async initAccounts() {
+        log('INFO', `Initializing ${this.config.accounts.length} accounts...`);
+        
+        // Assign proxies to accounts (random selection from available proxies)
+        const accountCount = this.config.accounts.length;
+        const proxyCount = this.proxies.length;
+        
+        if (proxyCount > 0) {
+            log('INFO', `Assigning random proxies to ${accountCount} accounts (${proxyCount} proxies available)`);
+            if (accountCount > proxyCount) {
+                log('INFO', `More accounts (${accountCount}) than proxies (${proxyCount}). Proxies will be randomly reused.`);
+            }
+        } else {
+            log('WARNING', 'No proxies available. All accounts will run without proxies.');
+        }
+        
+        // Initialize all account sessions
+        for (let i = 0; i < this.config.accounts.length; i++) {
+            const account = this.config.accounts[i];
+            // Randomly select a proxy from available proxies
+            const proxy = this.proxies.length > 0 
+                ? this.proxies[Math.floor(Math.random() * this.proxies.length)] 
+                : null;
+            
+            if (proxy) {
+                const proxyInfo = proxy.split(':');
+                log('INFO', `Account ${i + 1} assigned random proxy: ${proxyInfo[0]}:${proxyInfo[1]}`);
+            }
+            
+            const session = new AccountSession(i + 1, account, this.config, this.browser, proxy);
+            await session.initContext();
+            this.accounts.push(session);
+        }
+        
+        log('INFO', `All ${this.accounts.length} accounts initialized`);
+    }
+
+    async processAccountsBatch(accounts, batchNumber) {
+        log('INFO', `Processing batch ${batchNumber} (${accounts.length} accounts)...`);
+        
+        const results = await Promise.allSettled(
+            accounts.map(async (account) => {
+                try {
+                    log('INFO', `Starting runCycle for account ${account.accountId}`, account.accountId);
+                    const result = await account.runCycle();
+                    log('INFO', `runCycle completed for account ${account.accountId}, result: ${result}`, account.accountId);
+                    return result;
+                } catch (error) {
+                    log('ERROR', `Error in runCycle for account ${account.accountId}: ${error.message}`, account.accountId);
+                    log('ERROR', `Stack: ${error.stack}`, account.accountId);
+                    throw error;
+                }
+            })
+        );
+
+        // Log detailed results
+        results.forEach((result, index) => {
+            const account = accounts[index];
+            if (result.status === 'fulfilled') {
+                log('INFO', `Account ${account.accountId} result: ${result.value}`, account.accountId);
+            } else {
+                log('ERROR', `Account ${account.accountId} failed: ${result.reason?.message || 'Unknown error'}`, account.accountId);
+            }
+        });
+
+        const successful = results.filter(r => r.status === 'fulfilled' && r.value).length;
+        const failed = results.length - successful;
+        
+        log('INFO', `Batch ${batchNumber} completed: ${successful} successful, ${failed} failed`);
+        
+        return results;
+    }
+
+    async processAllAccounts() {
+        const batches = [];
+        for (let i = 0; i < this.accounts.length; i += this.concurrentLimit) {
+            const batch = this.accounts.slice(i, i + this.concurrentLimit);
+            batches.push(batch);
+        }
+
+        log('INFO', `Processing ${this.accounts.length} accounts in ${batches.length} batches (${this.concurrentLimit} concurrent)`);
+
+        for (let i = 0; i < batches.length; i++) {
+            await this.processAccountsBatch(batches[i], i + 1);
+            // Small delay between batches to avoid overwhelming the server
+            if (i < batches.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+        }
+    }
+
+    startFileWatcher() {
+        const configWatcher = chokidar.watch(this.configPath, {
+            persistent: true,
+            ignoreInitial: true
+        });
+
+        configWatcher.on('change', async (path) => {
+            log('INFO', `Configuration file ${path} changed, reloading...`);
+            try {
+                const newConfig = this._loadConfig(this.configPath);
+                this.config = newConfig;
+                this.maxRuntime = this.config.timing.max_runtime_hours * 60 * 60 * 1000;
+                log('INFO', 'Configuration reloaded successfully');
+            } catch (error) {
+                log('ERROR', `Failed to reload configuration: ${error.message}`);
+            }
+        });
+
+        const codeWatcher = chokidar.watch(['*.js', '*.json'], {
+            persistent: true,
+            ignoreInitial: true,
+            ignored: ['node_modules/**', '*.log', 'package-lock.json']
+        });
+
+        codeWatcher.on('change', async (path) => {
+            log('INFO', `Code file ${path} changed, restarting service...`);
+            this.shouldRestart = true;
+            await this.cleanup();
+            process.exit(0);
+        });
+
+        this.watcher = { configWatcher, codeWatcher };
+        log('INFO', 'File watcher started');
+    }
+
+    async run() {
+        try {
+            this.isRunning = true;
+            this.startFileWatcher();
+
+            await this.initBrowser();
+            await this.initAccounts();
+
+            const loginInterval = this.config.timing.login_interval_hours * 60 * 60 * 1000;
+            let nextLoginTime = new Date();
+
+            log('INFO', 'Starting multi-account auto-login service');
+            log('INFO', `Managing ${this.accounts.length} accounts`);
+            log('INFO', `Will run for ${this.config.timing.max_runtime_hours} hours`);
+            log('INFO', `Login interval: ${this.config.timing.login_interval_hours} hours`);
+            log('INFO', `Concurrent limit: ${this.concurrentLimit} accounts per batch`);
+
+            // Initial login for all accounts
+            log('INFO', 'Performing initial login for all accounts...');
+            await this.processAllAccounts();
+            nextLoginTime = new Date(Date.now() + loginInterval);
+
+            while (true) {
+                if (this.shouldRestart) {
+                    log('INFO', 'Restart requested, shutting down...');
+                    break;
+                }
+
+                const runtime = Date.now() - this.startTime.getTime();
+                if (runtime >= this.maxRuntime) {
+                    log('INFO', 'Maximum runtime reached (24 hours), stopping...');
+                    break;
+                }
+
+                const waitTime = nextLoginTime.getTime() - Date.now();
+                if (waitTime > 0) {
+                    log('INFO', `Waiting ${(waitTime / 60000).toFixed(1)} minutes until next cycle...`);
+                    const checkInterval = 5000;
+                    let remainingTime = waitTime;
+                    while (remainingTime > 0 && !this.shouldRestart) {
+                        const sleepTime = Math.min(checkInterval, remainingTime);
+                        await new Promise(resolve => setTimeout(resolve, sleepTime));
+                        remainingTime -= sleepTime;
+                    }
+                    if (this.shouldRestart) break;
+                }
+
+                log('INFO', 'Starting login cycle for all accounts...');
+                await this.processAllAccounts();
+
+                nextLoginTime = new Date(Date.now() + loginInterval);
+            }
+        } catch (error) {
+            log('ERROR', `Fatal error in run loop: ${error.message}`);
+        } finally {
+            this.isRunning = false;
+            await this.cleanup();
+        }
+    }
+
+    async cleanup() {
+        try {
+            if (this.watcher) {
+                if (this.watcher.configWatcher) {
+                    await this.watcher.configWatcher.close();
+                }
+                if (this.watcher.codeWatcher) {
+                    await this.watcher.codeWatcher.close();
+                }
+            }
+
+            log('INFO', 'Cleaning up all account sessions...');
+            await Promise.allSettled(
+                this.accounts.map(account => account.cleanup())
+            );
+
+            if (this.browser) {
+                await this.browser.close();
+            }
+            
+            log('INFO', 'Cleanup completed');
+            if (!this.shouldRestart) {
+                logFile.end();
+            }
+        } catch (error) {
+            log('ERROR', `Error during cleanup: ${error.message}`);
+        }
+    }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+    log('INFO', 'Received SIGINT, shutting down gracefully...');
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    log('INFO', 'Received SIGTERM, shutting down gracefully...');
+    process.exit(0);
+});
+
+// Main entry point
+async function main() {
+    const manager = new AutoLoginManager();
+    await manager.run();
+}
+
+main().catch(error => {
+    log('ERROR', `Fatal error: ${error.message}`);
+    process.exit(1);
+});
