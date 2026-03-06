@@ -5,6 +5,7 @@
   "main": "auto_login.js",
   "scripts": {
     "start": "node auto_login.js",
+    "create": "node auto_create.js",
     "dev": "nodemon auto_login.js",
     "install-browsers": "npx playwright install chromium"
   },
@@ -18,6 +19,7 @@
   "license": "MIT",
   "dependencies": {
     "chokidar": "^3.5.3",
+    "imap": "^0.8.19",
     "nopecha": "^1.0.11",
     "playwright": "^1.58.2"
   },

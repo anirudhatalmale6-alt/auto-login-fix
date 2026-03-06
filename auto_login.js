@@ -1346,80 +1346,146 @@ class AccountSession {
                 }
             }
 
-            // Find and click final login/submit button
-            log('INFO', 'Looking for final login/submit button', this.accountId);
-            let loginButtonSelector;
-            let loginButtonClicked = false;
+            // Click all continue/submit buttons until login completes.
+            // After CAPTCHA, there may be multiple steps (e.g., send code → continue → OTP → continue).
+            // We loop up to 5 times, clicking any visible continue/submit button each time.
+            const maxButtonClicks = 5;
+            for (let clickRound = 1; clickRound <= maxButtonClicks; clickRound++) {
+                log('INFO', `Post-CAPTCHA button click round ${clickRound}/${maxButtonClicks}`, this.accountId);
 
-            // Try to find StencilReactButton that is visible and enabled
-            try {
-                await this.page.waitForTimeout(500);
+                // First check if we're already logged in (not on login page anymore)
+                const currentUrl = this.page.url();
+                if (!currentUrl.includes('auth.hiring.amazon') && !currentUrl.includes('/login') && !currentUrl.includes('#/login')) {
+                    log('INFO', 'No longer on login page — login appears successful!', this.accountId);
+                    this.lastLoginTime = new Date();
+                    return true;
+                }
 
-                const buttons = await this.page.$$('button[data-test-component="StencilReactButton"]');
-                log('INFO', `Found ${buttons.length} StencilReactButton(s) on page`, this.accountId);
+                // Check for logged-in indicator
+                try {
+                    const indicator = await this.page.$(this.config.selectors.logged_in_indicator);
+                    if (indicator) {
+                        log('INFO', 'Login successful — logged-in indicator found', this.accountId);
+                        this.lastLoginTime = new Date();
+                        return true;
+                    }
+                } catch (e) {}
 
-                for (let i = 0; i < buttons.length; i++) {
-                    const isVisible = await buttons[i].isVisible();
-                    const isEnabled = await buttons[i].isEnabled();
-                    log('DEBUG', `Button ${i + 1}: visible=${isVisible}, enabled=${isEnabled}`, this.accountId);
+                // Look for visible, enabled continue/submit buttons
+                let buttonClicked = false;
+                await this.page.waitForTimeout(1000);
 
-                    if (isVisible && isEnabled) {
-                        log('INFO', `Clicking StencilReactButton ${i + 1} as submit button`, this.accountId);
-                        try {
-                            await buttons[i].click({ timeout: 5000 });
-                            loginButtonClicked = true;
+                // Strategy 1: StencilReactButton
+                try {
+                    const buttons = await this.page.$$('button[data-test-component="StencilReactButton"]');
+                    log('INFO', `Found ${buttons.length} StencilReactButton(s) on page`, this.accountId);
+
+                    for (let i = 0; i < buttons.length; i++) {
+                        const isVisible = await buttons[i].isVisible();
+                        const isEnabled = await buttons[i].isEnabled();
+                        if (isVisible && isEnabled) {
+                            const text = await buttons[i].textContent().catch(() => '');
+                            log('INFO', `Clicking StencilReactButton ${i + 1}: "${text.trim()}"`, this.accountId);
+                            try {
+                                await buttons[i].click({ timeout: 5000 });
+                            } catch (clickErr) {
+                                if (clickErr.message.includes('intercepts pointer events')) {
+                                    await buttons[i].click({ force: true, timeout: 5000 });
+                                } else {
+                                    throw clickErr;
+                                }
+                            }
+                            buttonClicked = true;
                             break;
-                        } catch (clickErr) {
-                            if (clickErr.message.includes('intercepts pointer events')) {
-                                log('WARNING', 'Submit button blocked by overlay, trying force click...', this.accountId);
-                                await buttons[i].click({ force: true, timeout: 5000 });
-                                loginButtonClicked = true;
+                        }
+                    }
+                } catch (error) {
+                    log('DEBUG', `StencilReactButton search error: ${error.message}`, this.accountId);
+                }
+
+                // Strategy 2: data-test-id="button-continue"
+                if (!buttonClicked) {
+                    try {
+                        const contBtns = await this.page.$$('button[data-test-id="button-continue"]');
+                        for (const btn of contBtns) {
+                            if (await btn.isVisible() && await btn.isEnabled()) {
+                                const text = await btn.textContent().catch(() => '');
+                                log('INFO', `Clicking button-continue: "${text.trim()}"`, this.accountId);
+                                try {
+                                    await btn.click({ timeout: 5000 });
+                                } catch (clickErr) {
+                                    await btn.click({ force: true, timeout: 5000 });
+                                }
+                                buttonClicked = true;
                                 break;
                             }
-                            throw clickErr;
                         }
+                    } catch (e) {
+                        log('DEBUG', `button-continue search error: ${e.message}`, this.accountId);
                     }
                 }
-            } catch (error) {
-                log('WARNING', `Error finding StencilReactButton: ${error.message}`, this.accountId);
-            }
 
-            // Fallback: try JS click or alternative selectors
-            if (!loginButtonClicked) {
-                try {
-                    // Try JavaScript click to bypass overlay
-                    const clicked = await this.page.evaluate(() => {
-                        const buttons = document.querySelectorAll('button[data-test-component="StencilReactButton"]');
-                        for (const btn of buttons) {
-                            if (btn.offsetParent !== null) { // visible
-                                btn.click();
-                                return true;
+                // Strategy 3: Any visible submit/continue button via JS
+                if (!buttonClicked) {
+                    try {
+                        const clicked = await this.page.evaluate(() => {
+                            const selectors = [
+                                'button[data-test-component="StencilReactButton"]',
+                                'button[data-test-id="button-continue"]',
+                                'button[type="submit"]',
+                                'button:not([disabled])'
+                            ];
+                            for (const sel of selectors) {
+                                const buttons = document.querySelectorAll(sel);
+                                for (const btn of buttons) {
+                                    if (btn.offsetParent !== null && !btn.disabled) {
+                                        const text = (btn.textContent || '').toLowerCase();
+                                        if (text.includes('continue') || text.includes('submit') || text.includes('sign in') || text.includes('login') || text.includes('verify') || text.includes('next')) {
+                                            btn.click();
+                                            return btn.textContent.trim().substring(0, 60);
+                                        }
+                                    }
+                                }
                             }
+                            return null;
+                        });
+                        if (clicked) {
+                            log('INFO', `Clicked button via JS: "${clicked}"`, this.accountId);
+                            buttonClicked = true;
                         }
-                        return false;
-                    });
-                    if (clicked) {
-                        log('INFO', 'Submit button clicked via JavaScript', this.accountId);
-                        loginButtonClicked = true;
+                    } catch (e) {
+                        log('DEBUG', `JS button click failed: ${e.message}`, this.accountId);
                     }
-                } catch (e) {
-                    log('DEBUG', `JS click fallback failed: ${e.message}`, this.accountId);
                 }
-            }
 
-            if (!loginButtonClicked) {
+                // Strategy 4: Config-based login button selector
+                if (!buttonClicked) {
+                    try {
+                        const loginButtonSelector = await this._findSelector(this.config.selectors.login_button, 5000);
+                        log('INFO', `Using config login button selector: ${loginButtonSelector}`, this.accountId);
+                        await this.page.click(loginButtonSelector);
+                        buttonClicked = true;
+                    } catch (error) {
+                        log('DEBUG', `Config login button not found: ${error.message}`, this.accountId);
+                    }
+                }
+
+                if (!buttonClicked) {
+                    log('INFO', 'No more clickable buttons found', this.accountId);
+                    break;
+                }
+
+                // Wait for page to respond after button click
+                log('INFO', 'Waiting for page to respond after button click...', this.accountId);
+                await this.page.waitForTimeout(3000);
+
+                // Wait for any navigation
                 try {
-                    loginButtonSelector = await this._findSelector(this.config.selectors.login_button, 10000);
-                    log('INFO', `Using alternative login button selector: ${loginButtonSelector}`, this.accountId);
-                    await this.page.click(loginButtonSelector);
-                    loginButtonClicked = true;
-                } catch (error) {
-                    log('ERROR', `Failed to click login button: ${error.message}`, this.accountId);
-                    throw new Error('Login button not found or not clickable');
-                }
+                    await this.page.waitForLoadState('networkidle', { timeout: 5000 });
+                } catch (e) {}
             }
 
-            // Wait for login to complete
+            // Final login check
             try {
                 await this.page.waitForSelector(this.config.selectors.logged_in_indicator, {
                     timeout: 15000
@@ -1429,7 +1495,7 @@ class AccountSession {
                 return true;
             } catch (error) {
                 const currentUrl = this.page.url();
-                if (currentUrl.toLowerCase().includes('login')) {
+                if (currentUrl.toLowerCase().includes('login') || currentUrl.includes('#/login')) {
                     log('ERROR', 'Login failed - still on login page', this.accountId);
                     return false;
                 }
