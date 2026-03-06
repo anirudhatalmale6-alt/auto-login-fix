@@ -815,56 +815,316 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
 
         // Fill email
         await fillField(page, 'email', accountData.email,
-            ['Email or mobile', 'Email', 'email', 'Email address'],
-            ['email', 'Email', 'Email or mobile'],
+            ['Email address', 'Email or mobile', 'Email', 'email'],
+            ['email', 'Email', 'Email or mobile', 'Email address'],
             ['#email', '#login', 'input[name="email"]', 'input[type="email"]', 'input[name="login EmailId"]', 'input[data-test-id*="email" i]'],
             accountNum);
 
-        // Fill phone (might not be on registration form, that's OK)
-        await fillField(page, 'phone', accountData.phone,
-            ['Phone', 'Mobile', 'Phone number', 'phone'],
-            ['Phone', 'phone', 'Mobile', 'mobile'],
-            ['#phoneNumber', '#phone', 'input[name="phone"]', 'input[name="phoneNumber"]', 'input[type="tel"]'],
+        // Re-enter email address (same value)
+        await fillField(page, 'confirmEmail', accountData.email,
+            ['Re-enter email', 'Confirm email', 'Re-enter email address'],
+            ['Re-enter', 're-enter email', 'Confirm email'],
+            ['input[name="confirmEmail"]', 'input[name="reenterEmail"]', 'input[name="confirm_email"]', 'input[data-test-id*="confirmEmail" i]', 'input[data-test-id*="reenter" i]'],
             accountNum);
+
+        // Fill mobile number
+        await fillField(page, 'phone', accountData.phone,
+            ['Mobile number', 'Phone', 'Mobile', 'Phone number'],
+            ['Phone', 'phone', 'Mobile', 'mobile', 'Phone number'],
+            ['#phoneNumber', '#phone', 'input[name="phone"]', 'input[name="phoneNumber"]', 'input[name="mobileNumber"]', 'input[type="tel"]'],
+            accountNum);
+
+        // Re-enter mobile number (same value)
+        await fillField(page, 'confirmPhone', accountData.phone,
+            ['Re-enter mobile', 'Confirm mobile', 'Re-enter mobile number'],
+            ['Re-enter mobile', 're-enter mobile', 'Confirm mobile'],
+            ['input[name="confirmPhone"]', 'input[name="reenterPhone"]', 'input[name="confirmMobile"]', 'input[name="reenterMobileNumber"]', 'input[data-test-id*="confirmMobile" i]', 'input[data-test-id*="reenter" i]'],
+            accountNum);
+
+        // Select Preferred Language dropdown → English
+        log('INFO', 'Selecting preferred language: English...', accountNum);
+        try {
+            let langSelected = false;
+
+            // Try Playwright getByLabel for the dropdown
+            const langSelectors = [
+                'select[name*="language" i]', 'select[id*="language" i]',
+                'select[data-test-id*="language" i]', 'select[aria-label*="language" i]',
+            ];
+
+            // Strategy 1: Find <select> element and choose option
+            for (const sel of langSelectors) {
+                try {
+                    const selectEl = await page.$(sel);
+                    if (selectEl && await selectEl.isVisible()) {
+                        await selectEl.selectOption({ label: 'English' });
+                        log('INFO', 'Selected English from language dropdown via select element', accountNum);
+                        langSelected = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 2: getByLabel
+            if (!langSelected) {
+                try {
+                    const langDropdown = page.getByLabel('Preferred language', { exact: false });
+                    if (await langDropdown.count() > 0 && await langDropdown.first().isVisible()) {
+                        const tag = await langDropdown.first().evaluate(el => el.tagName);
+                        if (tag === 'SELECT') {
+                            await langDropdown.first().selectOption({ label: 'English' });
+                        } else {
+                            // Custom dropdown — click to open then select
+                            await langDropdown.first().click();
+                            await page.waitForTimeout(500);
+                            const engOption = page.getByText('English', { exact: true });
+                            if (await engOption.count() > 0) {
+                                await engOption.first().click();
+                            }
+                        }
+                        log('INFO', 'Selected English via getByLabel', accountNum);
+                        langSelected = true;
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 3: JS — find select near "language" label, select English
+            if (!langSelected) {
+                const jsResult = await page.evaluate(() => {
+                    // Find all select elements
+                    const selects = document.querySelectorAll('select');
+                    for (const sel of selects) {
+                        const parent = sel.closest('div, fieldset');
+                        if (parent && parent.textContent.toLowerCase().includes('language')) {
+                            const options = sel.querySelectorAll('option');
+                            for (const opt of options) {
+                                if (opt.textContent.toLowerCase().includes('english')) {
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                                    return opt.textContent.trim();
+                                }
+                            }
+                        }
+                    }
+                    // Try custom dropdown (React/Stencil)
+                    const labels = document.querySelectorAll('label, .label, [class*="label"]');
+                    for (const lbl of labels) {
+                        if (lbl.textContent.toLowerCase().includes('language')) {
+                            const container = lbl.closest('div, fieldset, section');
+                            if (container) {
+                                // Click the dropdown trigger
+                                const trigger = container.querySelector('button, [role="listbox"], [role="combobox"], [class*="select"], [class*="dropdown"]');
+                                if (trigger) {
+                                    trigger.click();
+                                    return '__clicked_dropdown__';
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                });
+
+                if (jsResult === '__clicked_dropdown__') {
+                    await page.waitForTimeout(500);
+                    // Find and click "English" in the opened dropdown
+                    try {
+                        const engOpt = page.getByText('English', { exact: false }).first();
+                        if (await engOpt.isVisible()) {
+                            await engOpt.click();
+                            langSelected = true;
+                            log('INFO', 'Selected English from custom dropdown', accountNum);
+                        }
+                    } catch (e) {}
+                } else if (jsResult) {
+                    langSelected = true;
+                    log('INFO', `Selected language via JS: ${jsResult}`, accountNum);
+                }
+            }
+
+            if (!langSelected) {
+                log('WARNING', 'Could not select preferred language', accountNum);
+            }
+            await page.waitForTimeout(300);
+        } catch (e) {
+            log('WARNING', `Language selection error: ${e.message}`, accountNum);
+        }
+
+        // Select Preferred Time Zone dropdown → EST / Eastern
+        log('INFO', 'Selecting preferred time zone: EST...', accountNum);
+        try {
+            let tzSelected = false;
+
+            // Strategy 1: Find <select> for timezone
+            const tzSelectors = [
+                'select[name*="time" i]', 'select[name*="timezone" i]', 'select[name*="zone" i]',
+                'select[id*="time" i]', 'select[id*="timezone" i]',
+                'select[data-test-id*="time" i]', 'select[aria-label*="time" i]',
+            ];
+
+            for (const sel of tzSelectors) {
+                try {
+                    const selectEl = await page.$(sel);
+                    if (selectEl && await selectEl.isVisible()) {
+                        // Try to find EST/Eastern option
+                        const options = await selectEl.evaluate(el => {
+                            return Array.from(el.options).map(o => ({ value: o.value, text: o.textContent.trim() }));
+                        });
+                        log('DEBUG', `Timezone options: ${JSON.stringify(options.slice(0, 10))}...`, accountNum);
+                        const estOption = options.find(o =>
+                            o.text.toLowerCase().includes('eastern') ||
+                            o.text.includes('EST') ||
+                            o.text.includes('ET') ||
+                            o.value.toLowerCase().includes('eastern') ||
+                            o.value.includes('America/New_York') ||
+                            o.value.includes('US/Eastern')
+                        );
+                        if (estOption) {
+                            await selectEl.selectOption(estOption.value);
+                            log('INFO', `Selected timezone: ${estOption.text}`, accountNum);
+                            tzSelected = true;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 2: getByLabel
+            if (!tzSelected) {
+                try {
+                    const tzDropdown = page.getByLabel('Preferred time zone', { exact: false });
+                    if (await tzDropdown.count() > 0 && await tzDropdown.first().isVisible()) {
+                        const tag = await tzDropdown.first().evaluate(el => el.tagName);
+                        if (tag === 'SELECT') {
+                            // List options and find Eastern
+                            const opts = await tzDropdown.first().evaluate(el => {
+                                return Array.from(el.options).map(o => ({ value: o.value, text: o.textContent.trim() }));
+                            });
+                            const estOpt = opts.find(o =>
+                                o.text.toLowerCase().includes('eastern') || o.text.includes('EST') ||
+                                o.value.includes('America/New_York') || o.value.includes('US/Eastern')
+                            );
+                            if (estOpt) {
+                                await tzDropdown.first().selectOption(estOpt.value);
+                                log('INFO', `Selected timezone via getByLabel: ${estOpt.text}`, accountNum);
+                                tzSelected = true;
+                            }
+                        } else {
+                            // Custom dropdown
+                            await tzDropdown.first().click();
+                            await page.waitForTimeout(500);
+                            const estOption = page.getByText('Eastern', { exact: false }).first();
+                            if (await estOption.isVisible()) {
+                                await estOption.click();
+                                tzSelected = true;
+                                log('INFO', 'Selected Eastern timezone from custom dropdown', accountNum);
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // Strategy 3: JS fallback
+            if (!tzSelected) {
+                const jsResult = await page.evaluate(() => {
+                    const selects = document.querySelectorAll('select');
+                    for (const sel of selects) {
+                        const parent = sel.closest('div, fieldset');
+                        if (parent && (parent.textContent.toLowerCase().includes('time zone') || parent.textContent.toLowerCase().includes('timezone'))) {
+                            const options = sel.querySelectorAll('option');
+                            for (const opt of options) {
+                                const text = opt.textContent.toLowerCase();
+                                if (text.includes('eastern') || text.includes('est') || opt.value.includes('America/New_York') || opt.value.includes('US/Eastern')) {
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                                    return opt.textContent.trim();
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                });
+                if (jsResult) {
+                    tzSelected = true;
+                    log('INFO', `Selected timezone via JS: ${jsResult}`, accountNum);
+                }
+            }
+
+            if (!tzSelected) {
+                log('WARNING', 'Could not select preferred time zone', accountNum);
+            }
+            await page.waitForTimeout(300);
+        } catch (e) {
+            log('WARNING', `Timezone selection error: ${e.message}`, accountNum);
+        }
 
         // Fill PIN
         await fillField(page, 'pin', accountData.pin,
-            ['PIN', 'Password', 'Create a PIN', 'pin'],
-            ['PIN', 'pin', 'Password', 'password', 'Create a PIN'],
+            ['Create personal PIN', 'PIN', 'Password', 'Create a PIN', 'personal PIN'],
+            ['PIN', 'pin', 'Password', 'password', 'Create a PIN', '6-digit'],
             ['#pin', 'input[name="pin"]', 'input[type="password"]'],
             accountNum);
 
-        // Fill confirm PIN
+        // Re-enter PIN (same value)
         await fillField(page, 'confirmPin', accountData.confirmPin || accountData.pin,
-            ['Confirm PIN', 'Confirm password', 'Re-enter PIN', 'confirm'],
-            ['Confirm', 'confirm', 'Re-enter', 're-enter'],
-            ['#confirmPin', '#confirm-pin', 'input[name="confirmPin"]', 'input[name="confirm_pin"]'],
+            ['Re-enter personal PIN', 'Re-enter PIN', 'Confirm PIN', 'Re-enter the PIN'],
+            ['Re-enter', 're-enter', 'Confirm PIN', 'confirm'],
+            ['#confirmPin', '#confirm-pin', 'input[name="confirmPin"]', 'input[name="reenterPin"]', 'input[name="confirm_pin"]'],
             accountNum);
 
-        // Handle terms/privacy checkboxes
+        // Click "Yes" for SMS consent
+        log('INFO', 'Clicking Yes for SMS consent...', accountNum);
         try {
-            const checked = await page.evaluate(() => {
-                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                let count = 0;
-                for (const cb of checkboxes) {
-                    if (cb.offsetParent === null || cb.checked) continue;
-                    const parent = cb.closest('div, label, span, li, p');
-                    if (parent) {
-                        const text = parent.textContent.toLowerCase();
-                        // Only check terms/privacy, not middle name
-                        if ((text.includes('terms') || text.includes('privacy') || text.includes('agree') || text.includes('consent'))
-                            && !text.includes('middle name')) {
-                            cb.checked = true;
-                            cb.dispatchEvent(new Event('change', { bubbles: true }));
-                            cb.click();
-                            count++;
+            let smsClicked = false;
+
+            // Try clicking Yes button
+            const yesSelectors = [
+                'button:has-text("Yes")',
+                '[role="button"]:has-text("Yes")',
+                'input[type="radio"][value="yes"]',
+                'input[type="radio"][value="Yes"]',
+            ];
+            for (const sel of yesSelectors) {
+                try {
+                    const btn = await page.$(sel);
+                    if (btn && await btn.isVisible()) {
+                        await btn.click();
+                        log('INFO', `Clicked Yes for SMS consent: ${sel}`, accountNum);
+                        smsClicked = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+
+            // JS fallback — find Yes button near SMS/consent text
+            if (!smsClicked) {
+                const jsResult = await page.evaluate(() => {
+                    // Find section about SMS
+                    const allText = document.body.innerText;
+                    const buttons = document.querySelectorAll('button, [role="button"], input[type="radio"]');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || btn.value || '').trim();
+                        if (text === 'Yes' || text === 'yes') {
+                            btn.click();
+                            return 'Yes';
                         }
                     }
+                    return null;
+                });
+                if (jsResult) {
+                    log('INFO', 'Clicked Yes for SMS consent via JS', accountNum);
+                    smsClicked = true;
                 }
-                return count;
-            });
-            if (checked > 0) log('INFO', `Checked ${checked} terms/privacy checkbox(es)`, accountNum);
-        } catch (e) {}
+            }
+
+            if (!smsClicked) {
+                log('WARNING', 'Could not find Yes button for SMS consent', accountNum);
+            }
+            await page.waitForTimeout(300);
+        } catch (e) {
+            log('WARNING', `SMS consent error: ${e.message}`, accountNum);
+        }
 
         // Scroll down to make sure submit button is visible
         try {
@@ -886,6 +1146,7 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         // Try specific submit button selectors first
         let submitClicked = false;
         const submitSelectors = [
+            'button:has-text("Continue")',
             'button:has-text("Create account")',
             'button:has-text("Create Account")',
             'button:has-text("Register")',
