@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.4';
+const SCRIPT_VERSION = 'v9.5';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -1700,6 +1700,7 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         //   3. CAPTCHA visible? → solve it
         //   4. Continue/submit button? → click it
         const maxPostSubmitRounds = 10;
+        let captchaAlreadySolved = false; // Track if CAPTCHA was already solved this session
         for (let round = 1; round <= maxPostSubmitRounds; round++) {
             log('INFO', `Post-submit round ${round}/${maxPostSubmitRounds}, URL: ${page.url()}`, accountNum);
             await page.waitForTimeout(2000);
@@ -1762,43 +1763,106 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             } catch (e) {}
 
             // Priority 1: Check for CAPTCHA FIRST (registration flow: form → CAPTCHA → OTP)
-            const captchaModal = await page.$('#captchaModal');
-            const wafCaptcha = await page.$('awswaf-captcha');
-            if (captchaModal || wafCaptcha) {
-                log('INFO', `CAPTCHA detected (round ${round}), solving...`, accountNum);
-                const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
-                let solved = false;
-                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                    solved = await solveCaptcha(page, nopecha, accountNum);
-                    if (solved) break;
-                    log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
-                    await page.waitForTimeout(2000);
+            // IMPORTANT: awswaf-captcha element stays in DOM after solving, so we must
+            // check if it's actually active (overlay visible) AND not already solved.
+            if (!captchaAlreadySolved) {
+                const captchaActive = await page.evaluate(() => {
+                    // Check for visible CAPTCHA overlay
+                    const overlay = document.querySelector('#captchaModalOverlay');
+                    if (overlay) {
+                        const style = window.getComputedStyle(overlay);
+                        if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                            return true;
+                        }
+                    }
+                    // Check for visible captcha modal
+                    const modal = document.querySelector('#captchaModal');
+                    if (modal) {
+                        const style = window.getComputedStyle(modal);
+                        if (style.display !== 'none' && style.visibility !== 'hidden') return true;
+                    }
+                    // Check if awswaf-captcha is actively blocking (has visible content)
+                    const waf = document.querySelector('awswaf-captcha');
+                    if (waf) {
+                        const style = window.getComputedStyle(waf);
+                        // Only consider active if it has significant size (not collapsed/hidden)
+                        if (style.display !== 'none' && waf.offsetHeight > 50) return true;
+                    }
+                    return false;
+                }).catch(() => false);
+
+                if (captchaActive) {
+                    log('INFO', `CAPTCHA active (round ${round}), solving...`, accountNum);
+                    const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
+                    let solved = false;
+                    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                        solved = await solveCaptcha(page, nopecha, accountNum);
+                        if (solved) break;
+                        log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
+                        await page.waitForTimeout(2000);
+                    }
+                    if (!solved) {
+                        log('ERROR', 'Failed to solve CAPTCHA', accountNum);
+                        await context.close();
+                        return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
+                    }
+                    captchaAlreadySolved = true;
+                    log('INFO', 'CAPTCHA solved, moving to OTP detection on next round...', accountNum);
+                    await page.waitForTimeout(3000); // Wait for page to transition after CAPTCHA
+                    continue;
                 }
-                if (!solved) {
-                    log('ERROR', 'Failed to solve CAPTCHA', accountNum);
-                    await context.close();
-                    return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
-                }
-                // After CAPTCHA solved, continue loop to check for OTP on next round
-                continue;
+            } else {
+                log('DEBUG', `Skipping CAPTCHA check (already solved)`, accountNum);
             }
 
             // Priority 2: Check for OTP input (AFTER captcha is cleared)
-            // IMPORTANT: Do NOT use input[type="tel"] or input[type="number"] — they match phone fields
-            // on the registration form and cause false OTP detection.
-            // First verify we're actually on an OTP page by checking page text
+            // After CAPTCHA solved, we know we're past the registration form,
+            // so it's safe to use broader detection.
+            const curPageUrl = page.url();
             let isOtpPage = false;
-            try {
-                const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
-                isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
-                    pageText.includes('enter the code') || pageText.includes('enter otp') ||
-                    pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
-                    pageText.includes('sent a code') || pageText.includes('verify your') ||
-                    pageText.includes('one-time') || pageText.includes('one time') ||
-                    pageText.includes('verify your identity');
-            } catch (e) {}
 
-            // Narrow OTP selectors — only specific OTP-related attributes
+            // URL-based detection
+            if (curPageUrl.includes('verify') || curPageUrl.includes('otp') ||
+                curPageUrl.includes('confirm') || curPageUrl.includes('code')) {
+                isOtpPage = true;
+                log('INFO', 'URL suggests OTP page', accountNum);
+            }
+
+            // Page text detection
+            if (!isOtpPage) {
+                try {
+                    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
+                    isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
+                        pageText.includes('enter the code') || pageText.includes('enter otp') ||
+                        pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
+                        pageText.includes('sent a code') || pageText.includes('verify your') ||
+                        pageText.includes('one-time') || pageText.includes('one time') ||
+                        pageText.includes('verify your identity') || pageText.includes('enter your code') ||
+                        pageText.includes('code was sent') || pageText.includes('check your email');
+                    if (isOtpPage) log('INFO', 'Page text suggests OTP page', accountNum);
+                } catch (e) {}
+            }
+
+            // If CAPTCHA was already solved, we're definitely past registration form
+            // so any single input on the page is likely the OTP field
+            if (captchaAlreadySolved && !isOtpPage) {
+                // Check if we're still on registration form (many inputs) vs OTP page (1-2 inputs)
+                try {
+                    const inputCount = await page.evaluate(() => {
+                        return Array.from(document.querySelectorAll('input'))
+                            .filter(el => el.offsetParent !== null && el.type !== 'hidden').length;
+                    });
+                    // OTP page typically has 1-3 inputs; registration form has 10+
+                    if (inputCount > 0 && inputCount <= 4) {
+                        isOtpPage = true;
+                        log('INFO', `Post-CAPTCHA page has ${inputCount} inputs — likely OTP page`, accountNum);
+                    } else {
+                        log('DEBUG', `Page has ${inputCount} visible inputs`, accountNum);
+                    }
+                } catch (e) {}
+            }
+
+            // OTP selectors — specific attributes first
             const otpSelectors = [
                 'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
                 'input[name="otpCode"]', 'input[name="verifyCode"]', 'input[name="confirmCode"]',
@@ -1824,10 +1888,19 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 } catch (e) {}
             }
 
-            // Fallback: if page text confirms OTP page, find any text/tel input
-            // (safe to use tel/number here because we KNOW it's an OTP page)
+            // Fallback: if we know it's an OTP page, find any visible input
+            // (safe to use tel/number here because we confirmed it's NOT the registration form)
             if (!otpFieldFound && isOtpPage) {
-                log('INFO', 'Page text confirms OTP screen, looking for input...', accountNum);
+                log('INFO', 'OTP page confirmed, looking for any input...', accountNum);
+                // Log all visible inputs for debugging
+                try {
+                    const allInputs = await page.evaluate(() => {
+                        return Array.from(document.querySelectorAll('input'))
+                            .filter(el => el.offsetParent !== null)
+                            .map(el => ({ type: el.type, name: el.name, id: el.id, placeholder: el.placeholder, ariaLabel: el.getAttribute('aria-label') }));
+                    });
+                    log('INFO', `Visible inputs on OTP page: ${JSON.stringify(allInputs)}`, accountNum);
+                } catch (e) {}
                 const genericInput = await page.evaluate(() => {
                     const inputs = document.querySelectorAll('input');
                     for (const inp of inputs) {
