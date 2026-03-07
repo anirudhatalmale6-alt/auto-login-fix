@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.5';
+const SCRIPT_VERSION = 'v9.6';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -2185,7 +2185,9 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
         const isSuccess = !finalUrl.includes('create') && !finalUrl.includes('register') && !finalUrl.includes('error');
 
         if (isSuccess) {
-            log('INFO', `Account created successfully: ${accountData.email}`, accountNum);
+            log('INFO', `Account created successfully: ${accountData.email} — keeping browser OPEN`, accountNum);
+            // DON'T close context — keep the account logged in
+            return { success: true, email: accountData.email, page, context };
         } else {
             // Check for error messages
             const errorText = await page.evaluate(() => {
@@ -2195,10 +2197,9 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             if (errorText) {
                 log('WARNING', `Error on page: ${errorText}`, accountNum);
             }
+            await context.close();
+            return { success: false, email: accountData.email };
         }
-
-        await context.close();
-        return { success: isSuccess, email: accountData.email };
 
     } catch (error) {
         log('ERROR', `Account creation error: ${error.message}`, accountNum);
@@ -2414,8 +2415,37 @@ async function main() {
         log('INFO', `Successful accounts saved to ${accountsFile} — add these to config.json for auto-login`);
     }
 
-    await browser.close();
-    log('INFO', 'Done');
+    // Collect all open pages from successful accounts
+    const openPages = results.filter(r => r.success && r.page).map(r => ({ email: r.email, page: r.page, context: r.context }));
+
+    if (openPages.length === 0) {
+        log('INFO', 'No successful accounts to keep alive. Closing browser.');
+        await browser.close();
+        return;
+    }
+
+    // Keep alive — refresh all successful accounts periodically
+    log('INFO', `\n=== KEEPING ${openPages.length} ACCOUNTS ALIVE ===`);
+    log('INFO', 'Browsers will stay open. Refreshing every 90 minutes. Press Ctrl+C to stop.');
+
+    const refreshInterval = 90 * 60 * 1000; // 90 minutes
+
+    while (true) {
+        await new Promise(r => setTimeout(r, refreshInterval));
+
+        log('INFO', `\n=== Refreshing ${openPages.length} accounts ===`);
+        for (const acc of openPages) {
+            try {
+                const url = acc.page.url();
+                log('INFO', `Refreshing ${acc.email} (${url})...`);
+                await acc.page.goto('https://hiring.amazon.ca/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await acc.page.waitForTimeout(2000);
+                log('INFO', `Refreshed ${acc.email} — URL: ${acc.page.url()}`);
+            } catch (e) {
+                log('WARNING', `Refresh failed for ${acc.email}: ${e.message}`);
+            }
+        }
+    }
 }
 
 main().catch(error => {
