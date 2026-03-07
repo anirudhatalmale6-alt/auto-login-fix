@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "AWS Job Application Automation",
+  "version": "1.0.0",
+  "description": "Automated job application system with AWS multi-instance polling",
+
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "webRequest",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+
+  "host_permissions": [
+    "<all_urls>",
+    "https://hiring.amazon.ca/*",
+    "https://hiring.amazon.com/*",
+    "https://*.amazonaws.com/*",
+    "http://localhost:8080/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://hiring.amazon.ca/*", "https://hiring.amazon.com/*", "https://*.amazonaws.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
