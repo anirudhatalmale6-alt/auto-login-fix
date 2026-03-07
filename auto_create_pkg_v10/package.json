@@ -1,0 +1,19 @@
+{
+  "name": "auto-create-accounts",
+  "version": "1.0.0",
+  "description": "Auto account creation for Amazon Hiring Portal",
+  "main": "auto_create.js",
+  "scripts": {
+    "start": "node auto_create.js",
+    "create": "node auto_create.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "imap": "^0.8.19",
+    "nopecha": "^1.0.11",
+    "playwright": "^1.58.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
