@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.3';
+const SCRIPT_VERSION = 'v9.4';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -1761,16 +1761,52 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 }
             } catch (e) {}
 
-            // Priority 1: Check for OTP input field (must check BEFORE captcha)
+            // Priority 1: Check for CAPTCHA FIRST (registration flow: form → CAPTCHA → OTP)
+            const captchaModal = await page.$('#captchaModal');
+            const wafCaptcha = await page.$('awswaf-captcha');
+            if (captchaModal || wafCaptcha) {
+                log('INFO', `CAPTCHA detected (round ${round}), solving...`, accountNum);
+                const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
+                let solved = false;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    solved = await solveCaptcha(page, nopecha, accountNum);
+                    if (solved) break;
+                    log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
+                    await page.waitForTimeout(2000);
+                }
+                if (!solved) {
+                    log('ERROR', 'Failed to solve CAPTCHA', accountNum);
+                    await context.close();
+                    return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
+                }
+                // After CAPTCHA solved, continue loop to check for OTP on next round
+                continue;
+            }
+
+            // Priority 2: Check for OTP input (AFTER captcha is cleared)
+            // IMPORTANT: Do NOT use input[type="tel"] or input[type="number"] — they match phone fields
+            // on the registration form and cause false OTP detection.
+            // First verify we're actually on an OTP page by checking page text
+            let isOtpPage = false;
+            try {
+                const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
+                isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
+                    pageText.includes('enter the code') || pageText.includes('enter otp') ||
+                    pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
+                    pageText.includes('sent a code') || pageText.includes('verify your') ||
+                    pageText.includes('one-time') || pageText.includes('one time') ||
+                    pageText.includes('verify your identity');
+            } catch (e) {}
+
+            // Narrow OTP selectors — only specific OTP-related attributes
             const otpSelectors = [
                 'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
                 'input[name="otpCode"]', 'input[name="verifyCode"]', 'input[name="confirmCode"]',
                 'input[placeholder*="code" i]', 'input[placeholder*="otp" i]',
-                'input[placeholder*="verification" i]', 'input[placeholder*="enter" i]',
+                'input[placeholder*="verification" i]',
                 '#verificationCode', '#otp', '#code', '#otpCode',
                 'input[aria-label*="code" i]', 'input[aria-label*="verification" i]',
                 'input[aria-label*="otp" i]',
-                'input[type="tel"]', 'input[type="number"]',
                 'input[data-test-id*="otp" i]', 'input[data-test-id*="code" i]',
                 'input[data-test-id*="verify" i]',
             ];
@@ -1788,44 +1824,34 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 } catch (e) {}
             }
 
-            // Strategy 2: Check page text for OTP-related keywords
-            if (!otpFieldFound) {
-                try {
-                    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
-                    const isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
-                        pageText.includes('enter the code') || pageText.includes('enter otp') ||
-                        pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
-                        pageText.includes('sent a code') || pageText.includes('verify your') ||
-                        pageText.includes('one-time') || pageText.includes('one time');
-
-                    if (isOtpPage) {
-                        log('INFO', 'Page text suggests OTP screen, looking for any visible text input...', accountNum);
-                        const genericInput = await page.evaluate(() => {
-                            const inputs = document.querySelectorAll('input');
-                            for (const inp of inputs) {
-                                if (inp.offsetParent === null) continue;
-                                const t = inp.type.toLowerCase();
-                                if (t === 'hidden' || t === 'password' || t === 'email' || t === 'checkbox' || t === 'radio') continue;
-                                const n = (inp.name || '').toLowerCase();
-                                if (n === 'email' || n === 'login emailid' || n === 'username') continue;
-                                return { found: true, name: inp.name, id: inp.id, type: inp.type };
-                            }
-                            return { found: false };
-                        });
-                        if (genericInput.found) {
-                            if (genericInput.id) {
-                                otpFieldSelector = `#${genericInput.id}`;
-                            } else if (genericInput.name) {
-                                otpFieldSelector = `input[name="${genericInput.name}"]`;
-                            } else {
-                                otpFieldSelector = `input[type="${genericInput.type}"]`;
-                            }
-                            otpFieldFound = true;
-                            log('INFO', `Found OTP input via page text: ${otpFieldSelector} (name=${genericInput.name}, id=${genericInput.id})`, accountNum);
-                        }
+            // Fallback: if page text confirms OTP page, find any text/tel input
+            // (safe to use tel/number here because we KNOW it's an OTP page)
+            if (!otpFieldFound && isOtpPage) {
+                log('INFO', 'Page text confirms OTP screen, looking for input...', accountNum);
+                const genericInput = await page.evaluate(() => {
+                    const inputs = document.querySelectorAll('input');
+                    for (const inp of inputs) {
+                        if (inp.offsetParent === null) continue;
+                        const t = inp.type.toLowerCase();
+                        if (t === 'hidden' || t === 'password' || t === 'email' || t === 'checkbox' || t === 'radio') continue;
+                        const n = (inp.name || '').toLowerCase();
+                        if (n === 'email' || n === 'login emailid' || n === 'username' ||
+                            n === 'phonenumber' || n === 'phone' || n === 'reenterphonenumber' ||
+                            n === 'firstname' || n === 'lastname' || n === 'pin' || n === 'reenterpin') continue;
+                        return { found: true, name: inp.name, id: inp.id, type: inp.type };
                     }
-                } catch (e) {
-                    log('DEBUG', `Page text OTP detection error: ${e.message}`, accountNum);
+                    return { found: false };
+                }).catch(() => ({ found: false }));
+                if (genericInput.found) {
+                    if (genericInput.id) {
+                        otpFieldSelector = `#${genericInput.id}`;
+                    } else if (genericInput.name) {
+                        otpFieldSelector = `input[name="${genericInput.name}"]`;
+                    } else {
+                        otpFieldSelector = `input[type="${genericInput.type}"]`;
+                    }
+                    otpFieldFound = true;
+                    log('INFO', `Found OTP input via page text: ${otpFieldSelector} (name=${genericInput.name}, id=${genericInput.id})`, accountNum);
                 }
             }
 
@@ -2065,28 +2091,6 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 }
             } else if (otpFieldFound) {
                 log('WARNING', 'OTP field found but no IMAP config — cannot auto-fill OTP', accountNum);
-            }
-
-            // Priority 2: Check for CAPTCHA
-            const captchaModal = await page.$('#captchaModal');
-            const wafCaptcha = await page.$('awswaf-captcha');
-            if (captchaModal || wafCaptcha) {
-                log('INFO', `CAPTCHA detected (round ${round}), solving...`, accountNum);
-                const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
-                let solved = false;
-                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                    solved = await solveCaptcha(page, nopecha, accountNum);
-                    if (solved) break;
-                    log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
-                    await page.waitForTimeout(2000);
-                }
-                if (!solved) {
-                    log('ERROR', 'Failed to solve CAPTCHA', accountNum);
-                    await context.close();
-                    return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
-                }
-                // After CAPTCHA solved, continue loop to check for OTP on next round
-                continue;
             }
 
             // Priority 3: Click any continue button
