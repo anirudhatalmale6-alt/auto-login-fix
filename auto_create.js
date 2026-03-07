@@ -11,6 +11,8 @@
  * Config: create_config.json
  */
 
+const SCRIPT_VERSION = 'v9.0';
+
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -1449,140 +1451,382 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
             return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
         }
 
-        // Step 6: Handle CAPTCHA if it appears (CAPTCHA comes after filling details on signup too)
-        log('INFO', 'Checking for CAPTCHA...', accountNum);
-        const captchaModal = await page.$('#captchaModal');
-        const wafCaptcha = await page.$('awswaf-captcha');
-        if (captchaModal || wafCaptcha) {
-            log('INFO', 'CAPTCHA detected, solving...', accountNum);
-            const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
-            let solved = false;
-            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                solved = await solveCaptcha(page, nopecha, accountNum);
-                if (solved) break;
-                log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
-                await page.waitForTimeout(2000);
-            }
-            if (!solved) {
-                log('ERROR', 'Failed to solve CAPTCHA', accountNum);
-                await context.close();
-                return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
-            }
-        }
-
-        // Step 7: Click any remaining continue buttons (multiple rounds)
-        for (let i = 0; i < 5; i++) {
+        // Step 6-8: Unified post-submit loop
+        // Handles CAPTCHA → OTP → Continue buttons in correct order.
+        // After form submit, Amazon flow: form → CAPTCHA → OTP → Continue → done
+        // We loop and check for each state in priority order:
+        //   1. Already left auth page? → success
+        //   2. OTP input visible? → fetch OTP, fill, verify, click Continue
+        //   3. CAPTCHA visible? → solve it
+        //   4. Continue/submit button? → click it
+        const maxPostSubmitRounds = 10;
+        for (let round = 1; round <= maxPostSubmitRounds; round++) {
+            log('INFO', `Post-submit round ${round}/${maxPostSubmitRounds}, URL: ${page.url()}`, accountNum);
             await page.waitForTimeout(2000);
 
-            // Check again for "already registered" after each step
-            const regError = await page.evaluate(() => {
-                const text = document.body.innerText.toLowerCase();
-                return text.includes('already registered') || text.includes('already exists') ||
-                       text.includes('already have an account') || text.includes('email already');
-            });
-            if (regError) {
-                log('WARNING', `Account already registered (detected at step ${i + 1}): ${accountData.email}`, accountNum);
-                await context.close();
-                return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
+            // Check if we've left the auth page → success
+            const currentUrl = page.url();
+            if (!currentUrl.includes('auth.hiring.amazon') && !currentUrl.includes('#/login') &&
+                !currentUrl.includes('#/create') && !currentUrl.includes('#/register')) {
+                log('INFO', 'Left auth page — account creation successful!', accountNum);
+                break;
             }
 
-            // Check for another CAPTCHA (can appear again at different steps)
-            const captcha2 = await page.$('#captchaModal');
-            const waf2 = await page.$('awswaf-captcha');
-            if (captcha2 || waf2) {
-                log('INFO', `CAPTCHA appeared again at step ${i + 1}, solving...`, accountNum);
-                await solveCaptcha(page, nopecha, accountNum);
-                await page.waitForTimeout(2000);
-            }
-
-            const clicked = await clickContinueButton(page, accountNum);
-            if (!clicked) break;
-            log('INFO', `Post-submit continue button ${i + 1} clicked`, accountNum);
-        }
-
-        // Step 8: Handle OTP verification
-        log('INFO', 'Checking for OTP verification step...', accountNum);
-        await page.waitForTimeout(2000);
-
-        // Look for OTP input field
-        const otpSelectors = [
-            'input[name="otp"]',
-            'input[name="verificationCode"]',
-            'input[name="code"]',
-            'input[placeholder*="code" i]',
-            'input[placeholder*="otp" i]',
-            'input[placeholder*="verification" i]',
-            '#verificationCode',
-            '#otp',
-            '#code',
-        ];
-
-        let otpFieldFound = false;
-        for (const sel of otpSelectors) {
+            // Check for "already registered" errors
             try {
-                const el = await page.$(sel);
-                if (el && await el.isVisible()) {
-                    otpFieldFound = true;
-                    log('INFO', `OTP field found: ${sel}`, accountNum);
-                    break;
+                const regError = await page.evaluate(() => {
+                    const errorEls = document.querySelectorAll('[role="alert"], .error-message, [class*="error"], .field-error');
+                    const errorTexts = Array.from(errorEls).map(e => e.textContent.toLowerCase()).join(' ');
+                    if (errorTexts.includes('already registered') || errorTexts.includes('already exists') ||
+                        errorTexts.includes('email already') || errorTexts.includes('already in use')) {
+                        return errorTexts.substring(0, 200);
+                    }
+                    return null;
+                });
+                if (regError) {
+                    log('WARNING', `Account already registered (round ${round}): ${accountData.email}`, accountNum);
+                    await context.close();
+                    return { success: false, email: accountData.email, error: 'Already registered', skipped: true };
                 }
             } catch (e) {}
-        }
 
-        if (otpFieldFound && config.email_imap) {
-            log('INFO', 'Waiting for OTP email...', accountNum);
-            try {
-                const otp = await getOtpFromEmail(config.email_imap, accountData.email, 120000);
-                log('INFO', `OTP retrieved: ${otp}`, accountNum);
+            // Priority 1: Check for OTP input field (must check BEFORE captcha)
+            const otpSelectors = [
+                'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
+                'input[name="otpCode"]', 'input[name="verifyCode"]', 'input[name="confirmCode"]',
+                'input[placeholder*="code" i]', 'input[placeholder*="otp" i]',
+                'input[placeholder*="verification" i]', 'input[placeholder*="enter" i]',
+                '#verificationCode', '#otp', '#code', '#otpCode',
+                'input[aria-label*="code" i]', 'input[aria-label*="verification" i]',
+                'input[aria-label*="otp" i]',
+                'input[type="tel"]', 'input[type="number"]',
+                'input[data-test-id*="otp" i]', 'input[data-test-id*="code" i]',
+                'input[data-test-id*="verify" i]',
+            ];
 
-                // Fill OTP
-                for (const sel of otpSelectors) {
-                    try {
-                        const el = await page.$(sel);
-                        if (el && await el.isVisible()) {
-                            await el.fill(otp);
-                            log('INFO', 'OTP filled', accountNum);
-                            break;
-                        }
-                    } catch (e) {}
-                }
-
-                await page.waitForTimeout(500);
-
-                // Click verify/submit button
-                const verifyClicked = await clickContinueButton(page, accountNum);
-                log('INFO', `Verify button clicked: ${verifyClicked}`, accountNum);
-                await page.waitForTimeout(3000);
-
-                // After OTP verify, Amazon may show additional Continue button(s)
-                // Loop to click them until we leave auth page or no more buttons
-                for (let postOtpRound = 1; postOtpRound <= 5; postOtpRound++) {
-                    const curUrl = page.url();
-                    if (!curUrl.includes('auth.hiring.amazon')) {
-                        log('INFO', 'Left auth page after OTP — success!', accountNum);
+            let otpFieldFound = false;
+            let otpFieldSelector = null;
+            for (const sel of otpSelectors) {
+                try {
+                    const el = await page.$(sel);
+                    if (el && await el.isVisible()) {
+                        otpFieldFound = true;
+                        otpFieldSelector = sel;
                         break;
                     }
-                    log('INFO', `Post-OTP button round ${postOtpRound}/5, URL: ${curUrl}`, accountNum);
-                    try {
-                        await page.waitForLoadState('networkidle', { timeout: 5000 });
-                    } catch (e) {}
-                    const clicked = await clickContinueButton(page, accountNum);
-                    if (clicked) {
-                        log('INFO', `Post-OTP button ${postOtpRound} clicked`, accountNum);
-                        await page.waitForTimeout(3000);
-                    } else {
-                        log('INFO', 'No more post-OTP buttons', accountNum);
-                        break;
-                    }
-                }
-
-            } catch (e) {
-                log('ERROR', `OTP retrieval failed: ${e.message}`, accountNum);
-                await context.close();
-                return { success: false, email: accountData.email, error: 'OTP failed' };
+                } catch (e) {}
             }
-        } else if (otpFieldFound) {
-            log('WARNING', 'OTP field found but no IMAP config — manual OTP entry needed', accountNum);
+
+            // Strategy 2: Check page text for OTP-related keywords
+            if (!otpFieldFound) {
+                try {
+                    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase());
+                    const isOtpPage = pageText.includes('verification code') || pageText.includes('enter code') ||
+                        pageText.includes('enter the code') || pageText.includes('enter otp') ||
+                        pageText.includes('we sent') || pageText.includes('we\'ve sent') ||
+                        pageText.includes('sent a code') || pageText.includes('verify your') ||
+                        pageText.includes('one-time') || pageText.includes('one time');
+
+                    if (isOtpPage) {
+                        log('INFO', 'Page text suggests OTP screen, looking for any visible text input...', accountNum);
+                        const genericInput = await page.evaluate(() => {
+                            const inputs = document.querySelectorAll('input');
+                            for (const inp of inputs) {
+                                if (inp.offsetParent === null) continue;
+                                const t = inp.type.toLowerCase();
+                                if (t === 'hidden' || t === 'password' || t === 'email' || t === 'checkbox' || t === 'radio') continue;
+                                const n = (inp.name || '').toLowerCase();
+                                if (n === 'email' || n === 'login emailid' || n === 'username') continue;
+                                return { found: true, name: inp.name, id: inp.id, type: inp.type };
+                            }
+                            return { found: false };
+                        });
+                        if (genericInput.found) {
+                            if (genericInput.id) {
+                                otpFieldSelector = `#${genericInput.id}`;
+                            } else if (genericInput.name) {
+                                otpFieldSelector = `input[name="${genericInput.name}"]`;
+                            } else {
+                                otpFieldSelector = `input[type="${genericInput.type}"]`;
+                            }
+                            otpFieldFound = true;
+                            log('INFO', `Found OTP input via page text: ${otpFieldSelector} (name=${genericInput.name}, id=${genericInput.id})`, accountNum);
+                        }
+                    }
+                } catch (e) {
+                    log('DEBUG', `Page text OTP detection error: ${e.message}`, accountNum);
+                }
+            }
+
+            // If OTP field found → handle OTP flow
+            if (otpFieldFound && config.email_imap) {
+                log('INFO', `OTP input detected (${otpFieldSelector}), fetching OTP from email...`, accountNum);
+
+                try {
+                    await page.screenshot({ path: 'debug_otp_screen.png' });
+                    log('INFO', 'Debug screenshot: debug_otp_screen.png', accountNum);
+                } catch (e) {}
+
+                try {
+                    const otp = await getOtpFromEmail(config.email_imap, accountData.email, 120000);
+                    log('INFO', `OTP retrieved: ${otp}`, accountNum);
+
+                    // Fill OTP
+                    const otpInput = await page.$(otpFieldSelector);
+                    if (otpInput) {
+                        await otpInput.fill(otp);
+                        log('INFO', 'OTP filled into input field', accountNum);
+                        await page.waitForTimeout(1500);
+                    }
+
+                    try {
+                        await page.screenshot({ path: 'debug_otp_filled.png' });
+                    } catch (e) {}
+
+                    // Click Verify/Continue button after OTP
+                    log('INFO', 'Looking for Verify/Continue button after OTP...', accountNum);
+                    let verifyClicked = false;
+
+                    // Log all buttons for debugging
+                    try {
+                        const allButtons = await page.evaluate(() => {
+                            return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                                .map(b => ({
+                                    text: (b.textContent || b.value || '').trim().substring(0, 60),
+                                    visible: b.offsetParent !== null,
+                                    disabled: b.disabled,
+                                    testComponent: b.getAttribute('data-test-component')
+                                }));
+                        });
+                        log('INFO', `Buttons on OTP page: ${JSON.stringify(allButtons)}`, accountNum);
+                    } catch (e) {}
+
+                    // Try text-based selectors
+                    const verifySelectors = [
+                        'button:has-text("Verify")', 'button:has-text("Submit")',
+                        'button:has-text("Confirm")', 'button:has-text("Continue")',
+                        'button:has-text("Done")', 'button:has-text("Next")',
+                        '[role="button"]:has-text("Verify")', '[role="button"]:has-text("Continue")',
+                    ];
+
+                    for (const sel of verifySelectors) {
+                        try {
+                            const btn = await page.$(sel);
+                            if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                                const btnText = await btn.textContent().catch(() => '');
+                                log('INFO', `Clicking verify button: "${btnText.trim()}" (${sel})`, accountNum);
+                                await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true, timeout: 5000 }));
+                                verifyClicked = true;
+                                break;
+                            }
+                        } catch (e) {}
+                    }
+
+                    // JS fallback for verify button
+                    if (!verifyClicked) {
+                        const jsClicked = await page.evaluate(() => {
+                            const elements = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                            const keywords = ['verify', 'submit', 'confirm', 'continue', 'done', 'next', 'send'];
+                            for (const el of elements) {
+                                if (el.offsetParent === null || el.disabled) continue;
+                                const text = (el.textContent || el.value || '').toLowerCase().trim();
+                                if (keywords.some(kw => text.includes(kw))) {
+                                    el.click();
+                                    return (el.textContent || el.value || '').trim().substring(0, 60);
+                                }
+                            }
+                            return null;
+                        });
+                        if (jsClicked) {
+                            log('INFO', `Clicked verify via JS: "${jsClicked}"`, accountNum);
+                            verifyClicked = true;
+                        }
+                    }
+
+                    // StencilReactButton fallback
+                    if (!verifyClicked) {
+                        try {
+                            const stencilBtns = await page.$$('button[data-test-component="StencilReactButton"]');
+                            for (const btn of stencilBtns) {
+                                if (await btn.isVisible() && await btn.isEnabled()) {
+                                    const text = await btn.textContent().catch(() => '');
+                                    const lower = text.toLowerCase().trim();
+                                    if (lower.includes('sign in') || lower.includes('login') || lower.includes('resend') || lower.includes('back')) continue;
+                                    log('INFO', `Clicking StencilReactButton as verify: "${text.trim()}"`, accountNum);
+                                    await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true }));
+                                    verifyClicked = true;
+                                    break;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Last resort: any visible button (skip sign-in/resend/back)
+                    if (!verifyClicked) {
+                        const lastResort = await page.evaluate(() => {
+                            const buttons = document.querySelectorAll('button, input[type="submit"]');
+                            for (const btn of buttons) {
+                                if (btn.offsetParent === null || btn.disabled) continue;
+                                const text = (btn.textContent || btn.value || '').trim();
+                                const lower = text.toLowerCase();
+                                if (lower.includes('resend') || lower.includes('back') || lower.includes('cancel') ||
+                                    lower.includes('sign in') || lower.includes('login')) continue;
+                                btn.click();
+                                return text.substring(0, 60);
+                            }
+                            return null;
+                        });
+                        if (lastResort) {
+                            log('INFO', `Clicked verify via last resort: "${lastResort}"`, accountNum);
+                            verifyClicked = true;
+                        }
+                    }
+
+                    if (verifyClicked) {
+                        log('INFO', 'Verify button clicked, waiting for response...', accountNum);
+                        await page.waitForTimeout(3000);
+                        try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch (e) {}
+
+                        try {
+                            await page.screenshot({ path: 'debug_after_verify.png' });
+                        } catch (e) {}
+
+                        // Post-verify Continue loop (same as auto_login.js v7.1)
+                        // Amazon shows Continue button after OTP verify — must click it
+                        for (let postVerifyRound = 1; postVerifyRound <= 5; postVerifyRound++) {
+                            const postUrl = page.url();
+                            if (!postUrl.includes('auth.hiring.amazon')) {
+                                log('INFO', 'Redirected away from auth page — success!', accountNum);
+                                break;
+                            }
+                            log('INFO', `Post-verify round ${postVerifyRound}/5, URL: ${postUrl}`, accountNum);
+
+                            let postBtnClicked = false;
+                            const postVerifySelectors = [
+                                'button:has-text("Continue")', 'button:has-text("Done")',
+                                'button:has-text("Next")', 'button:has-text("Proceed")',
+                                'button:has-text("Submit")', 'button:has-text("OK")',
+                                '[role="button"]:has-text("Continue")', '[role="button"]:has-text("Done")',
+                            ];
+
+                            for (const sel of postVerifySelectors) {
+                                try {
+                                    const btn = await page.$(sel);
+                                    if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                                        const btnText = await btn.textContent().catch(() => '');
+                                        log('INFO', `Clicking post-verify: "${btnText.trim()}" (${sel})`, accountNum);
+                                        await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true, timeout: 5000 }));
+                                        postBtnClicked = true;
+                                        break;
+                                    }
+                                } catch (e) {}
+                            }
+
+                            // StencilReactButton (skip sign-in)
+                            if (!postBtnClicked) {
+                                try {
+                                    const stencilBtns = await page.$$('button[data-test-component="StencilReactButton"]');
+                                    for (const btn of stencilBtns) {
+                                        if (await btn.isVisible() && await btn.isEnabled()) {
+                                            const text = await btn.textContent().catch(() => '');
+                                            const lower = text.toLowerCase().trim();
+                                            if (lower.includes('sign in') || lower.includes('login') || lower.includes('log in')) continue;
+                                            if (lower.includes('resend') || lower.includes('back') || lower.includes('cancel')) continue;
+                                            log('INFO', `Clicking StencilReactButton post-verify: "${text.trim()}"`, accountNum);
+                                            await btn.click({ timeout: 5000 }).catch(() => btn.click({ force: true }));
+                                            postBtnClicked = true;
+                                            break;
+                                        }
+                                    }
+                                } catch (e) {}
+                            }
+
+                            // JS fallback (skip sign-in/resend/back)
+                            if (!postBtnClicked) {
+                                const jsResult = await page.evaluate(() => {
+                                    const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                                    for (const btn of buttons) {
+                                        if (btn.offsetParent === null || btn.disabled) continue;
+                                        const text = (btn.textContent || btn.value || '').toLowerCase().trim();
+                                        if (text.includes('sign in') || text.includes('login') || text.includes('log in')) continue;
+                                        if (text.includes('resend') || text.includes('back') || text.includes('cancel')) continue;
+                                        if (text.length === 0) continue;
+                                        btn.click();
+                                        return (btn.textContent || btn.value || '').trim().substring(0, 60);
+                                    }
+                                    return null;
+                                });
+                                if (jsResult) {
+                                    log('INFO', `Clicked post-verify via JS: "${jsResult}"`, accountNum);
+                                    postBtnClicked = true;
+                                }
+                            }
+
+                            if (postBtnClicked) {
+                                await page.waitForTimeout(3000);
+                                try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch (e) {}
+                            } else {
+                                log('INFO', 'No more post-verify buttons', accountNum);
+                                break;
+                            }
+                        }
+
+                        // Navigate to hiring.amazon.ca to establish session
+                        const postOtpUrl = page.url();
+                        log('INFO', `Post-OTP URL: ${postOtpUrl}`, accountNum);
+                        if (postOtpUrl.includes('auth.hiring.amazon')) {
+                            log('INFO', 'Still on auth page, navigating to hiring.amazon.ca...', accountNum);
+                            try {
+                                await page.goto('https://hiring.amazon.ca/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                                await page.waitForTimeout(3000);
+                                log('INFO', `Final URL after nav: ${page.url()}`, accountNum);
+                            } catch (e) {}
+                        }
+                    }
+
+                    // OTP handled — break out of main loop
+                    break;
+
+                } catch (otpErr) {
+                    log('ERROR', `OTP retrieval/filling failed: ${otpErr.message}`, accountNum);
+                    await context.close();
+                    return { success: false, email: accountData.email, error: 'OTP failed' };
+                }
+            } else if (otpFieldFound) {
+                log('WARNING', 'OTP field found but no IMAP config — cannot auto-fill OTP', accountNum);
+            }
+
+            // Priority 2: Check for CAPTCHA
+            const captchaModal = await page.$('#captchaModal');
+            const wafCaptcha = await page.$('awswaf-captcha');
+            if (captchaModal || wafCaptcha) {
+                log('INFO', `CAPTCHA detected (round ${round}), solving...`, accountNum);
+                const maxAttempts = config.captcha ? config.captcha.max_attempts || 3 : 3;
+                let solved = false;
+                for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                    solved = await solveCaptcha(page, nopecha, accountNum);
+                    if (solved) break;
+                    log('WARNING', `CAPTCHA attempt ${attempt} failed, retrying...`, accountNum);
+                    await page.waitForTimeout(2000);
+                }
+                if (!solved) {
+                    log('ERROR', 'Failed to solve CAPTCHA', accountNum);
+                    await context.close();
+                    return { success: false, email: accountData.email, error: 'CAPTCHA failed' };
+                }
+                // After CAPTCHA solved, continue loop to check for OTP on next round
+                continue;
+            }
+
+            // Priority 3: Click any continue button
+            const clicked = await clickContinueButton(page, accountNum);
+            if (clicked) {
+                log('INFO', `Continue button clicked (round ${round})`, accountNum);
+            } else {
+                log('INFO', `No buttons to click (round ${round})`, accountNum);
+                // If no OTP, no CAPTCHA, no buttons — we might be done
+                break;
+            }
         }
 
         // Step 9: Final check
@@ -1678,6 +1922,7 @@ function generateAccounts(config) {
 
 // Main entry point
 async function main() {
+    log('INFO', `=== Auto Account Creator ${SCRIPT_VERSION} ===`);
     const configPath = process.argv[2] || 'create_config.json';
 
     if (!fs.existsSync(configPath)) {
