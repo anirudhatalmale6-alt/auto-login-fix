@@ -1,0 +1,29 @@
+{
+  "create": {
+    "count": 100,
+    "email_template": "youremail+{}@gmail.com",
+    "default_pin": "112233",
+    "first_name": "John",
+    "last_name": "Doe",
+    "random_phone": true,
+    "start_index": 1,
+    "emails": null
+  },
+  "email_imap": {
+    "user": "YOUR_GMAIL@gmail.com",
+    "password": "YOUR_GMAIL_APP_PASSWORD",
+    "host": "imap.gmail.com",
+    "port": 993
+  },
+  "captcha": {
+    "solver": "nopecha",
+    "api_key": "sub_1T7hCICRwBwvt6ptwdkdoTCd",
+    "max_attempts": 3,
+    "timeout": 60000
+  },
+  "timing": {
+    "delay_between_accounts": 5000,
+    "concurrent_limit": 10,
+    "page_load_timeout": 30000
+  }
+}

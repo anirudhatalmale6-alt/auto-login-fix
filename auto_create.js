@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.0';
+const SCRIPT_VERSION = 'v9.1';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -50,15 +50,25 @@ async function solveCaptcha(page, nopecha, accountNum) {
     }
 
     try {
-        // Wait for CAPTCHA modal
-        log('INFO', 'Waiting for CAPTCHA modal...', accountNum);
+        // Wait for CAPTCHA — can be #captchaModal OR awswaf-captcha (Shadow DOM)
+        log('INFO', 'Waiting for CAPTCHA...', accountNum);
+        let captchaFound = false;
         try {
-            await page.waitForSelector('#captchaModal', { timeout: 15000, state: 'attached' });
+            await page.waitForSelector('#captchaModal, awswaf-captcha', { timeout: 15000, state: 'attached' });
+            captchaFound = true;
         } catch (e) {
-            log('INFO', 'No CAPTCHA modal found, might not need solving', accountNum);
-            return true; // No captcha = success
+            // Double-check with JS in case selectors didn't match
+            captchaFound = await page.evaluate(() => {
+                return !!(document.querySelector('#captchaModal') || document.querySelector('awswaf-captcha'));
+            }).catch(() => false);
         }
 
+        if (!captchaFound) {
+            log('INFO', 'No CAPTCHA found, might not need solving', accountNum);
+            return true;
+        }
+
+        log('INFO', 'CAPTCHA element found on page', accountNum);
         await page.waitForTimeout(2000);
 
         // Click audio button — may be in regular DOM, inside #captchaModal, or inside Shadow DOM
@@ -1490,6 +1500,37 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 }
             } catch (e) {}
 
+            // Check for phone/form errors and retry with new number
+            try {
+                const formErrors = await page.evaluate(() => {
+                    const errorEls = document.querySelectorAll('[role="alert"], .error-message, [class*="error"], .field-error, [class*="validation"]');
+                    const visible = Array.from(errorEls).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0);
+                    return visible.map(e => e.textContent.trim().toLowerCase()).join(' | ');
+                });
+                if (formErrors && (formErrors.includes('phone') || formErrors.includes('mobile') ||
+                    formErrors.includes('number') || formErrors.includes('invalid') ||
+                    formErrors.includes('use a different'))) {
+                    const newPhone = generateRandomPhone();
+                    log('INFO', `Phone error in post-submit loop, retrying with: ${newPhone}`, accountNum);
+                    try {
+                        const telInputs = await page.$$('input[type="tel"]');
+                        for (const tel of telInputs) {
+                            if (await tel.isVisible()) {
+                                await tel.fill('');
+                                await page.waitForTimeout(200);
+                                await tel.fill(newPhone);
+                                await page.waitForTimeout(200);
+                            }
+                        }
+                        accountData.phone = newPhone;
+                    } catch (e) {}
+                    // Re-click submit
+                    await clickContinueButton(page, accountNum);
+                    await page.waitForTimeout(3000);
+                    continue; // Re-check in next round
+                }
+            } catch (e) {}
+
             // Priority 1: Check for OTP input field (must check BEFORE captcha)
             const otpSelectors = [
                 'input[name="otp"]', 'input[name="verificationCode"]', 'input[name="code"]',
@@ -2011,7 +2052,7 @@ async function main() {
     log('INFO', `Browser launched (headless: ${headless})`);
 
     // Process accounts
-    const concurrentLimit = (config.timing && config.timing.concurrent_limit) || 3;
+    const concurrentLimit = (config.timing && config.timing.concurrent_limit) || 10;
     const delayBetween = (config.timing && config.timing.delay_between_accounts) || 5000;
     const results = [];
 
