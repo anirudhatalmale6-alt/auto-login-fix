@@ -1,0 +1,14 @@
+{
+  "accounts_file": "../created_accounts.json",
+  "email_imap": {
+    "user": "YOUR_GMAIL@gmail.com",
+    "password": "YOUR_GMAIL_APP_PASSWORD",
+    "host": "imap.gmail.com",
+    "port": 993
+  },
+  "captcha": {
+    "solver": "nopecha",
+    "api_key": "sub_1T7hCICRwBwvt6ptwdkdoTCd",
+    "max_attempts": 3
+  }
+}
