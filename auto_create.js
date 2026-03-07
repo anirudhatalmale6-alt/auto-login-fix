@@ -1364,8 +1364,72 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
 
         await page.waitForTimeout(3000);
 
-        // Step 5b: Check for "already registered" errors
-        // ONLY check error elements, NOT full page text (registration page has "Already have an account?" link)
+        // Step 5b: Check for phone/form errors and retry with new phone number
+        const maxPhoneRetries = 5;
+        for (let phoneRetry = 0; phoneRetry < maxPhoneRetries; phoneRetry++) {
+            // Check for any form validation errors
+            const formErrors = await page.evaluate(() => {
+                const errorEls = document.querySelectorAll('[role="alert"], .error-message, [class*="error"], .field-error, [class*="validation"]');
+                const visible = Array.from(errorEls).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0);
+                return visible.map(e => e.textContent.trim().toLowerCase()).join(' | ');
+            }).catch(() => '');
+
+            if (!formErrors) break; // No errors, continue
+
+            log('INFO', `Form errors after submit: ${formErrors.substring(0, 200)}`, accountNum);
+
+            // Check if error is phone-related
+            const isPhoneError = formErrors.includes('phone') || formErrors.includes('mobile') ||
+                formErrors.includes('number') || formErrors.includes('invalid') ||
+                formErrors.includes('already') || formErrors.includes('registered') ||
+                formErrors.includes('use a different');
+
+            if (isPhoneError && phoneRetry < maxPhoneRetries - 1) {
+                // Generate new random phone and retry
+                const newPhone = generateRandomPhone();
+                log('INFO', `Phone error detected, retrying with new number: ${newPhone} (attempt ${phoneRetry + 2}/${maxPhoneRetries})`, accountNum);
+
+                // Clear and re-fill phone fields
+                try {
+                    const telInputs = await page.$$('input[type="tel"]');
+                    for (const tel of telInputs) {
+                        if (await tel.isVisible()) {
+                            await tel.fill('');
+                            await page.waitForTimeout(200);
+                            await tel.fill(newPhone);
+                            await page.waitForTimeout(200);
+                        }
+                    }
+                    log('INFO', `Re-filled ${telInputs.length} phone fields with: ${newPhone}`, accountNum);
+                } catch (e) {
+                    log('DEBUG', `Phone re-fill error: ${e.message}`, accountNum);
+                }
+
+                // Update accountData for later use
+                accountData.phone = newPhone;
+
+                await page.waitForTimeout(1000);
+
+                // Click submit again
+                log('INFO', 'Re-clicking submit after phone change...', accountNum);
+                for (const sel of submitSelectors) {
+                    try {
+                        const btn = await page.$(sel);
+                        if (btn && await btn.isVisible() && await btn.isEnabled()) {
+                            await btn.click({ timeout: 5000 });
+                            break;
+                        }
+                    } catch (e) {}
+                }
+                // Fallback submit
+                await clickContinueButton(page, accountNum);
+                await page.waitForTimeout(3000);
+            } else {
+                break; // Not a phone error or max retries reached
+            }
+        }
+
+        // Step 5c: Check for "already registered" errors (email-related — skip this account)
         const alreadyRegistered = await page.evaluate(() => {
             const errorEls = document.querySelectorAll('[role="alert"], .error-message, [class*="error-text"], [class*="errorMessage"], .form-error, .field-error');
             const errorTexts = Array.from(errorEls).map(e => e.textContent.toLowerCase()).join(' ');
@@ -1377,7 +1441,7 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
                 return errorTexts.substring(0, 200);
             }
             return null;
-        });
+        }).catch(() => null);
 
         if (alreadyRegistered) {
             log('WARNING', `Account already registered: ${accountData.email} — error: "${alreadyRegistered}" — SKIPPING`, accountNum);
