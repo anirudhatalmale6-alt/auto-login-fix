@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.2';
+const SCRIPT_VERSION = 'v9.3';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -68,7 +68,23 @@ async function solveCaptcha(page, nopecha, accountNum) {
         }
 
         log('INFO', 'CAPTCHA element found on page', accountNum);
-        await page.waitForTimeout(2000);
+
+        // Log which CAPTCHA elements exist
+        const captchaInfo = await page.evaluate(() => {
+            const modal = document.querySelector('#captchaModal');
+            const waf = document.querySelector('awswaf-captcha');
+            return {
+                hasModal: !!modal,
+                modalVisible: modal ? (modal.offsetParent !== null || window.getComputedStyle(modal).display !== 'none') : false,
+                hasWaf: !!waf,
+                wafHasShadowRoot: waf ? !!waf.shadowRoot : false,
+                hasAudioBtn: !!document.querySelector('#amzn-btn-audio-internal'),
+            };
+        }).catch(() => ({}));
+        log('INFO', `CAPTCHA structure: ${JSON.stringify(captchaInfo)}`, accountNum);
+
+        // Wait longer for CAPTCHA to fully render (Shadow DOM takes time)
+        await page.waitForTimeout(3000);
 
         // ===== PHASE 1: Click audio button =====
         let audioClicked = false;
@@ -96,6 +112,8 @@ async function solveCaptcha(page, nopecha, accountNum) {
             } catch (e) {}
         }
 
+        if (!audioClicked) log('DEBUG', 'Strategy 1 (direct selector) failed', accountNum);
+
         // Strategy 2: Playwright shadow-piercing selector (>> pierces Shadow DOM)
         if (!audioClicked) {
             const piercingSelectors = [
@@ -116,6 +134,8 @@ async function solveCaptcha(page, nopecha, accountNum) {
             }
         }
 
+        if (!audioClicked) log('DEBUG', 'Strategy 2 (piercing selector) failed', accountNum);
+
         // Strategy 3: Wait for button to appear
         if (!audioClicked) {
             try {
@@ -128,6 +148,8 @@ async function solveCaptcha(page, nopecha, accountNum) {
                 }
             } catch (e) {}
         }
+
+        if (!audioClicked) log('DEBUG', 'Strategy 3 (wait for selector) failed', accountNum);
 
         // Strategy 4: JavaScript DOM + Shadow DOM traversal
         if (!audioClicked) {
@@ -701,12 +723,21 @@ async function createAccount(browser, config, accountData, accountNum, proxies, 
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
 
-    // Stealth
+    // Stealth + Shadow DOM patch
     await page.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
         window.chrome = { runtime: {} };
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+        // CRITICAL: Force all Shadow DOM roots to be OPEN.
+        // AWS WAF CAPTCHA uses mode:'closed' which makes shadowRoot return null.
+        // By patching attachShadow, we force mode:'open' so we can access the
+        // audio element, input field, and buttons inside the CAPTCHA.
+        const _origAttachShadow = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function(init) {
+            return _origAttachShadow.call(this, { ...init, mode: 'open' });
+        };
     });
 
     // Monitor network
