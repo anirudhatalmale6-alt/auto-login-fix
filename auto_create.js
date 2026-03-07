@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.1';
+const SCRIPT_VERSION = 'v9.2';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -57,7 +57,6 @@ async function solveCaptcha(page, nopecha, accountNum) {
             await page.waitForSelector('#captchaModal, awswaf-captcha', { timeout: 15000, state: 'attached' });
             captchaFound = true;
         } catch (e) {
-            // Double-check with JS in case selectors didn't match
             captchaFound = await page.evaluate(() => {
                 return !!(document.querySelector('#captchaModal') || document.querySelector('awswaf-captcha'));
             }).catch(() => false);
@@ -71,10 +70,10 @@ async function solveCaptcha(page, nopecha, accountNum) {
         log('INFO', 'CAPTCHA element found on page', accountNum);
         await page.waitForTimeout(2000);
 
-        // Click audio button — may be in regular DOM, inside #captchaModal, or inside Shadow DOM
+        // ===== PHASE 1: Click audio button =====
         let audioClicked = false;
 
-        // Strategy 1: Direct selector
+        // Strategy 1: Direct Playwright selectors (regular DOM)
         for (const sel of ['#captchaModal #amzn-btn-audio-internal', '#amzn-btn-audio-internal']) {
             try {
                 const btn = await page.$(sel);
@@ -82,7 +81,13 @@ async function solveCaptcha(page, nopecha, accountNum) {
                     const isVisible = await btn.isVisible().catch(() => true);
                     const isEnabled = await btn.isEnabled().catch(() => true);
                     if (isVisible && isEnabled) {
-                        await btn.click({ force: true, timeout: 5000 });
+                        await btn.scrollIntoViewIfNeeded().catch(() => {});
+                        await page.waitForTimeout(500);
+                        try {
+                            await btn.click({ timeout: 5000 });
+                        } catch (e) {
+                            await btn.click({ force: true, timeout: 5000 });
+                        }
                         log('INFO', `Audio button clicked via: ${sel}`, accountNum);
                         audioClicked = true;
                         break;
@@ -91,7 +96,27 @@ async function solveCaptcha(page, nopecha, accountNum) {
             } catch (e) {}
         }
 
-        // Strategy 2: Wait for it to appear (may render with delay)
+        // Strategy 2: Playwright shadow-piercing selector (>> pierces Shadow DOM)
+        if (!audioClicked) {
+            const piercingSelectors = [
+                'awswaf-captcha >> #amzn-btn-audio-internal',
+                'awswaf-captcha >> button',
+                '#captchaModal >> #amzn-btn-audio-internal',
+            ];
+            for (const sel of piercingSelectors) {
+                try {
+                    const btn = await page.$(sel);
+                    if (btn) {
+                        await btn.click({ force: true, timeout: 5000 });
+                        log('INFO', `Audio button clicked via piercing: ${sel}`, accountNum);
+                        audioClicked = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // Strategy 3: Wait for button to appear
         if (!audioClicked) {
             try {
                 await page.waitForSelector('#amzn-btn-audio-internal', { timeout: 10000, state: 'attached' });
@@ -101,39 +126,43 @@ async function solveCaptcha(page, nopecha, accountNum) {
                     log('INFO', 'Audio button clicked after wait', accountNum);
                     audioClicked = true;
                 }
-            } catch (e) {
-                log('DEBUG', `Audio button wait failed: ${e.message.substring(0, 60)}`, accountNum);
-            }
+            } catch (e) {}
         }
 
-        // Strategy 3: JavaScript DOM search (including inside captcha modal)
+        // Strategy 4: JavaScript DOM + Shadow DOM traversal
         if (!audioClicked) {
             try {
                 const clicked = await page.evaluate(() => {
-                    // Try in captcha modal
+                    // Regular DOM
                     const modal = document.querySelector('#captchaModal');
                     if (modal) {
                         const btn = modal.querySelector('#amzn-btn-audio-internal');
                         if (btn) { btn.click(); return 'modal'; }
                     }
-                    // Try global
                     const globalBtn = document.querySelector('#amzn-btn-audio-internal');
                     if (globalBtn) { globalBtn.click(); return 'global'; }
-                    // Try inside any shadow roots
+                    // Shadow DOM traversal
                     function findInShadow(root) {
                         const btn = root.querySelector('#amzn-btn-audio-internal');
                         if (btn) { btn.click(); return true; }
                         const els = root.querySelectorAll('*');
                         for (const el of els) {
                             if (el.shadowRoot) {
-                                const found = findInShadow(el.shadowRoot);
-                                if (found) return true;
+                                if (findInShadow(el.shadowRoot)) return true;
                             }
                         }
                         return false;
                     }
+                    // Search awswaf-captcha shadow root
                     const waf = document.querySelector('awswaf-captcha');
                     if (waf && waf.shadowRoot && findInShadow(waf.shadowRoot)) return 'shadow';
+                    // Search #captchaModal children shadow roots
+                    if (modal) {
+                        const modalEls = modal.querySelectorAll('*');
+                        for (const el of modalEls) {
+                            if (el.shadowRoot && findInShadow(el.shadowRoot)) return 'modal-shadow';
+                        }
+                    }
                     // Search all shadow roots
                     const allEls = document.querySelectorAll('*');
                     for (const el of allEls) {
@@ -145,12 +174,10 @@ async function solveCaptcha(page, nopecha, accountNum) {
                     log('INFO', `Audio button clicked via JS: ${clicked}`, accountNum);
                     audioClicked = true;
                 }
-            } catch (e) {
-                log('DEBUG', `JS audio button search failed: ${e.message.substring(0, 60)}`, accountNum);
-            }
+            } catch (e) {}
         }
 
-        // Strategy 4: Find any button with "audio" in its text/aria-label
+        // Strategy 5: Find any button with "audio" text (Shadow DOM traversal)
         if (!audioClicked) {
             try {
                 const clicked = await page.evaluate(() => {
@@ -185,16 +212,28 @@ async function solveCaptcha(page, nopecha, accountNum) {
 
         if (!audioClicked) {
             log('WARNING', 'Audio button not found after all strategies', accountNum);
-            // Take debug screenshot
-            try { await page.screenshot({ path: 'debug_captcha_no_audio.png' }); } catch (e) {}
+            // Debug: dump shadow root info
+            const debugInfo = await page.evaluate(() => {
+                const waf = document.querySelector('awswaf-captcha');
+                if (!waf) return 'awswaf-captcha not found';
+                if (!waf.shadowRoot) return 'awswaf-captcha has no shadowRoot (closed)';
+                return JSON.stringify({
+                    childCount: waf.shadowRoot.children.length,
+                    innerHTML: waf.shadowRoot.innerHTML.substring(0, 1000),
+                    buttons: waf.shadowRoot.querySelectorAll('button').length,
+                });
+            }).catch(() => 'evaluate failed');
+            log('DEBUG', `Shadow DOM debug: ${debugInfo}`, accountNum);
+            try { await page.screenshot({ path: `debug_captcha_no_audio_${accountNum}.png` }); } catch (e) {}
             return false;
         }
 
         await page.waitForTimeout(3000);
 
-        // Extract audio from Shadow DOM
+        // ===== PHASE 2: Extract audio data =====
         let audioData = null;
-        for (let i = 0; i < 15; i++) {
+        const audioStartTime = Date.now();
+        while (Date.now() - audioStartTime < 20000) {
             audioData = await page.evaluate(() => {
                 function findAudioInShadow(root) {
                     const audioElements = root.querySelectorAll('audio');
@@ -221,56 +260,181 @@ async function solveCaptcha(page, nopecha, accountNum) {
                     }
                     return null;
                 }
+                // Search awswaf-captcha shadow root
                 const waf = document.querySelector('awswaf-captcha');
-                if (waf && waf.shadowRoot) return findAudioInShadow(waf.shadowRoot);
-                return null;
+                if (waf && waf.shadowRoot) {
+                    const r = findAudioInShadow(waf.shadowRoot);
+                    if (r) return r;
+                }
+                // Search #captchaModal children
+                const modal = document.querySelector('#captchaModal');
+                if (modal) {
+                    const els = modal.querySelectorAll('*');
+                    for (const el of els) {
+                        if (el.shadowRoot) {
+                            const r = findAudioInShadow(el.shadowRoot);
+                            if (r) return r;
+                        }
+                    }
+                }
+                // Fallback: entire document
+                return findAudioInShadow(document);
             });
             if (audioData) break;
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(500);
+        }
+
+        // If no audio found, try clicking play/listen button inside Shadow DOM
+        if (!audioData) {
+            log('WARNING', 'No audio data yet, trying play button inside shadow DOM...', accountNum);
+            const playClicked = await page.evaluate(() => {
+                function findPlay(root) {
+                    const buttons = root.querySelectorAll('button, [role="button"]');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || '').toLowerCase();
+                        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                        if (text.includes('play') || text.includes('listen') || aria.includes('play') || aria.includes('listen')) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    const els = root.querySelectorAll('*');
+                    for (const el of els) {
+                        if (el.shadowRoot) { if (findPlay(el.shadowRoot)) return true; }
+                    }
+                    return false;
+                }
+                const waf = document.querySelector('awswaf-captcha');
+                if (waf && waf.shadowRoot) return findPlay(waf.shadowRoot);
+                return false;
+            });
+            if (playClicked) {
+                log('INFO', 'Clicked play button, waiting for audio...', accountNum);
+                await page.waitForTimeout(3000);
+                // Retry audio extraction
+                audioData = await page.evaluate(() => {
+                    function findAudioInShadow(root) {
+                        const audioElements = root.querySelectorAll('audio');
+                        for (const audio of audioElements) {
+                            const src = audio.src || audio.currentSrc;
+                            if (src && src.startsWith('data:audio')) {
+                                const match = src.match(/^data:audio\/[^;]+;base64,(.+)$/);
+                                if (match) return match[1];
+                            }
+                        }
+                        const allElements = root.querySelectorAll('*');
+                        for (const el of allElements) {
+                            if (el.shadowRoot) {
+                                const result = findAudioInShadow(el.shadowRoot);
+                                if (result) return result;
+                            }
+                        }
+                        return null;
+                    }
+                    const waf = document.querySelector('awswaf-captcha');
+                    if (waf && waf.shadowRoot) return findAudioInShadow(waf.shadowRoot);
+                    return findAudioInShadow(document);
+                });
+            }
         }
 
         if (!audioData) {
-            log('ERROR', 'Could not extract audio data from Shadow DOM', accountNum);
+            log('ERROR', 'Could not extract audio data', accountNum);
+            const debugInfo = await page.evaluate(() => {
+                const waf = document.querySelector('awswaf-captcha');
+                if (!waf) return 'awswaf-captcha not found';
+                if (!waf.shadowRoot) return 'no shadowRoot (closed)';
+                return JSON.stringify({
+                    audioCount: waf.shadowRoot.querySelectorAll('audio').length,
+                    inputCount: waf.shadowRoot.querySelectorAll('input').length,
+                    buttonCount: waf.shadowRoot.querySelectorAll('button').length,
+                    html: waf.shadowRoot.innerHTML.substring(0, 500),
+                });
+            }).catch(() => 'evaluate failed');
+            log('DEBUG', `Shadow DOM debug: ${debugInfo}`, accountNum);
             return false;
         }
 
         log('INFO', `Audio extracted (${audioData.length} chars)`, accountNum);
 
-        // Solve with NopeCHA
+        // ===== PHASE 3: Solve with NopeCHA =====
         const result = await nopecha.solveRecognition({ type: 'awscaptcha', audio_data: [audioData] });
         const answer = Array.isArray(result) ? result[0] : result;
         log('INFO', `NopeCHA answer: "${answer}"`, accountNum);
 
-        // Type answer into Shadow DOM input
-        await page.evaluate((ans) => {
+        // ===== PHASE 4: Type answer into input =====
+        let inputTyped = await page.evaluate((ans) => {
             function findInput(root) {
-                const inputs = root.querySelectorAll('input[type="text"], input:not([type])');
-                for (const input of inputs) {
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(input, ans);
-                    input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                    input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                    return true;
+                const selectors = ['input[type="text"]', 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="password"])'];
+                for (const sel of selectors) {
+                    const inputs = root.querySelectorAll(sel);
+                    for (const input of inputs) {
+                        input.value = '';
+                        input.focus();
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, ans);
+                        input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true }));
+                        return true;
+                    }
                 }
                 const allEls = root.querySelectorAll('*');
                 for (const el of allEls) {
                     if (el.shadowRoot) { const r = findInput(el.shadowRoot); if (r) return r; }
                 }
-                return null;
+                return false;
             }
             const waf = document.querySelector('awswaf-captcha');
-            if (waf && waf.shadowRoot) return findInput(waf.shadowRoot);
+            if (waf && waf.shadowRoot && findInput(waf.shadowRoot)) return true;
+            const modal = document.querySelector('#captchaModal');
+            if (modal) {
+                const els = modal.querySelectorAll('*');
+                for (const el of els) {
+                    if (el.shadowRoot && findInput(el.shadowRoot)) return true;
+                }
+            }
+            return false;
         }, answer);
+
+        // Fallback: Playwright shadow-piercing selectors for input
+        if (!inputTyped) {
+            log('WARNING', 'JS input fill failed, trying Playwright piercing selectors...', accountNum);
+            const piercingInputSelectors = [
+                'awswaf-captcha >> input[type="text"]',
+                'awswaf-captcha >> input',
+                '#captchaForm >> input[type="text"]',
+                '#captchaForm >> input',
+            ];
+            for (const sel of piercingInputSelectors) {
+                try {
+                    const input = await page.$(sel);
+                    if (input) {
+                        await input.fill(answer);
+                        log('INFO', `Typed answer via Playwright piercing: ${sel}`, accountNum);
+                        inputTyped = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
+
+        if (!inputTyped) {
+            log('ERROR', 'Could not find CAPTCHA input field', accountNum);
+            return false;
+        }
 
         await page.waitForTimeout(500);
 
-        // Click submit in Shadow DOM
-        await page.evaluate(() => {
+        // ===== PHASE 5: Click submit button =====
+        let submitted = await page.evaluate(() => {
             function findSubmit(root) {
                 const buttons = root.querySelectorAll('button, [role="button"]');
                 for (const btn of buttons) {
                     const text = (btn.textContent || '').toLowerCase().trim();
-                    if (text.includes('submit') || text.includes('verify') || text.includes('confirm')) {
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    if (text.includes('submit') || text.includes('verify') || text.includes('confirm') ||
+                        aria.includes('submit') || aria.includes('verify') || aria.includes('confirm')) {
                         btn.click();
                         return true;
                     }
@@ -279,30 +443,65 @@ async function solveCaptcha(page, nopecha, accountNum) {
                 for (const el of allEls) {
                     if (el.shadowRoot) { const r = findSubmit(el.shadowRoot); if (r) return r; }
                 }
-                return null;
+                return false;
             }
             const waf = document.querySelector('awswaf-captcha');
-            if (waf && waf.shadowRoot) return findSubmit(waf.shadowRoot);
+            if (waf && waf.shadowRoot && findSubmit(waf.shadowRoot)) return true;
+            const modal = document.querySelector('#captchaModal');
+            if (modal) {
+                const els = modal.querySelectorAll('*');
+                for (const el of els) {
+                    if (el.shadowRoot && findSubmit(el.shadowRoot)) return true;
+                }
+            }
+            return false;
         });
+
+        // Fallback: Playwright piercing for submit
+        if (!submitted) {
+            const piercingSubmitSelectors = [
+                'awswaf-captcha >> button',
+                '#captchaForm >> button[type="submit"]',
+            ];
+            for (const sel of piercingSubmitSelectors) {
+                try {
+                    const btn = await page.$(sel);
+                    if (btn && await btn.isVisible()) {
+                        await btn.click({ force: true });
+                        log('INFO', `Submit clicked via Playwright piercing: ${sel}`, accountNum);
+                        submitted = true;
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
 
         log('INFO', 'CAPTCHA submit clicked', accountNum);
         await page.waitForTimeout(5000);
 
-        // Check if overlay cleared
-        const overlayGone = await page.evaluate(() => {
+        // Check if CAPTCHA cleared
+        const captchaGone = await page.evaluate(() => {
             const overlay = document.querySelector('#captchaModalOverlay');
-            if (!overlay) return true;
-            const style = window.getComputedStyle(overlay);
-            return style.display === 'none' || style.visibility === 'hidden' ||
-                   style.pointerEvents === 'none' || style.opacity === '0';
+            if (overlay) {
+                const style = window.getComputedStyle(overlay);
+                if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                    style.pointerEvents !== 'none' && style.opacity !== '0') return false;
+            }
+            // Also check if awswaf-captcha is still active
+            const waf = document.querySelector('awswaf-captcha');
+            if (waf) {
+                const style = window.getComputedStyle(waf);
+                if (style.display === 'none' || style.visibility === 'hidden') return true;
+            }
+            return true;
         });
 
-        if (overlayGone) {
+        if (captchaGone) {
             log('INFO', 'CAPTCHA solved!', accountNum);
             return true;
         }
 
-        log('WARNING', 'CAPTCHA overlay still present', accountNum);
+        log('WARNING', 'CAPTCHA may still be present', accountNum);
         return false;
 
     } catch (error) {
