@@ -11,7 +11,7 @@
  * Config: create_config.json
  */
 
-const SCRIPT_VERSION = 'v9.6';
+const SCRIPT_VERSION = 'v9.7';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -2416,7 +2416,12 @@ async function main() {
     }
 
     // Collect all open pages from successful accounts
-    const openPages = results.filter(r => r.success && r.page).map(r => ({ email: r.email, page: r.page, context: r.context }));
+    const openPages = results.filter(r => r.success && r.page).map(r => ({
+        email: r.email,
+        page: r.page,
+        context: r.context,
+        pin: config.create.default_pin || '112233',
+    }));
 
     if (openPages.length === 0) {
         log('INFO', 'No successful accounts to keep alive. Closing browser.');
@@ -2424,25 +2429,114 @@ async function main() {
         return;
     }
 
-    // Keep alive — refresh all successful accounts periodically
+    // Keep alive — check session and re-login if needed (like auto_login.js)
     log('INFO', `\n=== KEEPING ${openPages.length} ACCOUNTS ALIVE ===`);
-    log('INFO', 'Browsers will stay open. Refreshing every 90 minutes. Press Ctrl+C to stop.');
+    log('INFO', 'Browsers stay open. Checking sessions every 90 min. Re-login if expired. Ctrl+C to stop.');
 
     const refreshInterval = 90 * 60 * 1000; // 90 minutes
 
     while (true) {
         await new Promise(r => setTimeout(r, refreshInterval));
 
-        log('INFO', `\n=== Refreshing ${openPages.length} accounts ===`);
+        log('INFO', `\n=== Session check for ${openPages.length} accounts ===`);
         for (const acc of openPages) {
             try {
-                const url = acc.page.url();
-                log('INFO', `Refreshing ${acc.email} (${url})...`);
+                // Navigate to hiring portal to check if still logged in
+                log('INFO', `Checking session: ${acc.email}...`);
                 await acc.page.goto('https://hiring.amazon.ca/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-                await acc.page.waitForTimeout(2000);
-                log('INFO', `Refreshed ${acc.email} — URL: ${acc.page.url()}`);
+                await acc.page.waitForTimeout(3000);
+
+                const currentUrl = acc.page.url();
+                log('INFO', `${acc.email} — URL: ${currentUrl}`);
+
+                // If redirected to auth page, session expired — re-login
+                if (currentUrl.includes('auth.hiring.amazon') || currentUrl.includes('#/login')) {
+                    log('WARNING', `Session expired for ${acc.email} — re-logging in...`);
+
+                    // Fill email/login
+                    try {
+                        const emailInput = await acc.page.$('input[name="email"], input[name="login EmailId"], input[type="email"], #email, #login');
+                        if (emailInput && await emailInput.isVisible()) {
+                            await emailInput.fill(acc.email);
+                            log('INFO', `Filled email for re-login: ${acc.email}`);
+                        }
+                    } catch (e) {}
+
+                    // Fill PIN
+                    try {
+                        const pinInput = await acc.page.$('input[type="password"], input[name="pin"], #pin');
+                        if (pinInput && await pinInput.isVisible()) {
+                            await pinInput.fill(acc.pin);
+                            log('INFO', 'Filled PIN for re-login');
+                        }
+                    } catch (e) {}
+
+                    await acc.page.waitForTimeout(500);
+
+                    // Click sign in
+                    try {
+                        const signInBtn = await acc.page.$('button:has-text("Sign In"), button:has-text("Log In"), button[type="submit"]');
+                        if (signInBtn && await signInBtn.isVisible()) {
+                            await signInBtn.click();
+                            log('INFO', 'Clicked Sign In for re-login');
+                        } else {
+                            await clickContinueButton(acc.page, null);
+                        }
+                    } catch (e) {}
+
+                    await acc.page.waitForTimeout(5000);
+
+                    // Handle CAPTCHA if it appears
+                    const captcha = await acc.page.$('#captchaModal, awswaf-captcha');
+                    if (captcha) {
+                        log('INFO', `CAPTCHA on re-login for ${acc.email}, solving...`);
+                        await solveCaptcha(acc.page, nopecha, null);
+                        await acc.page.waitForTimeout(3000);
+                    }
+
+                    // Handle OTP if needed
+                    try {
+                        const pageText = await acc.page.evaluate(() => document.body.innerText.toLowerCase());
+                        if (pageText.includes('verification code') || pageText.includes('enter code') || pageText.includes('we sent')) {
+                            log('INFO', `OTP needed for re-login: ${acc.email}`);
+                            if (config.email_imap) {
+                                const otp = await getOtpFromEmail(config.email_imap, acc.email, 120000);
+                                log('INFO', `Re-login OTP: ${otp}`);
+                                // Find and fill OTP input
+                                const inputs = await acc.page.$$('input');
+                                for (const inp of inputs) {
+                                    if (await inp.isVisible()) {
+                                        const t = await inp.evaluate(el => el.type);
+                                        if (t !== 'hidden' && t !== 'password' && t !== 'email') {
+                                            await inp.fill(otp);
+                                            break;
+                                        }
+                                    }
+                                }
+                                await acc.page.waitForTimeout(500);
+                                await clickContinueButton(acc.page, null);
+                                await acc.page.waitForTimeout(5000);
+
+                                // Post-OTP continue buttons
+                                for (let i = 0; i < 3; i++) {
+                                    const postUrl = acc.page.url();
+                                    if (!postUrl.includes('auth.hiring.amazon')) break;
+                                    await clickContinueButton(acc.page, null);
+                                    await acc.page.waitForTimeout(3000);
+                                }
+                            }
+                        }
+                    } catch (e) {}
+
+                    // Navigate to portal
+                    await acc.page.goto('https://hiring.amazon.ca/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+                    await acc.page.waitForTimeout(2000);
+                    log('INFO', `Re-login done for ${acc.email} — URL: ${acc.page.url()}`);
+                } else {
+                    log('INFO', `${acc.email} — session still active`);
+                }
             } catch (e) {
-                log('WARNING', `Refresh failed for ${acc.email}: ${e.message}`);
+                log('WARNING', `Session check failed for ${acc.email}: ${e.message}`);
             }
         }
     }
