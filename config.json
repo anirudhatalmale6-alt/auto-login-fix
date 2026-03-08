@@ -1,0 +1,48 @@
+{
+  "extension_path": "./extension",
+  "website": {
+    "url": "https://auth.hiring.amazon.com/#/login"
+  },
+  "accounts": [
+    {
+      "email": "kush26540@gmail.com",
+      "pin": "112233"
+    }
+  ],
+  "selectors": {
+    "email_field": "#login[name='login EmailId'], #login, input[name='login EmailId']",
+    "continue_button": "button[data-test-component='StencilReactButton']",
+    "pin_field": "#pin, input[type='password'], input[name='pin'], input[placeholder*='pin' i]",
+    "login_button": "button[data-test-component='StencilReactButton'], button[type='submit'], button:has-text('Sign in'), button:has-text('Login')",
+    "logout_button": "#logout",
+    "logged_in_indicator": ".user-menu, [data-testid='user-menu']"
+  },
+  "timing": {
+    "login_interval_hours": 1.0,
+    "max_runtime_hours": 0,
+    "page_load_timeout": 30000,
+    "action_delay": 1000,
+    "concurrent_limit": 3
+  },
+  "captcha": {
+    "solver": "nopecha",
+    "api_key": "sub_1T7hCICRwBwvt6ptwdkdoTCd",
+    "max_attempts": 3,
+    "timeout": 60000
+  },
+  "email_imap": {
+    "user": "YOUR_GMAIL@gmail.com",
+    "password": "YOUR_GMAIL_APP_PASSWORD",
+    "host": "imap.gmail.com",
+    "port": 993
+  },
+  "interview": {
+    "enabled": false,
+    "application_id": "YOUR_APPLICATION_ID",
+    "job_id": "JOB-CA-0000000441",
+    "schedule_id": "SCH-CA-0000005127",
+    "account_index": 0,
+    "poll_interval_ms": 2000,
+    "max_poll_minutes": 120
+  }
+}

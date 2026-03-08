@@ -3,11 +3,12 @@
  * Handles token expiration and automatic re-login for 100 accounts.
  */
 
-const SCRIPT_VERSION = 'v7.1';
+const SCRIPT_VERSION = 'v8.0';
 
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const chokidar = require('chokidar');
 const { Configuration, NopeCHAApi } = require('nopecha');
 const Imap = require('imap');
@@ -42,7 +43,8 @@ function parseProxy(proxyString) {
     return {
         server: `http://${host}:${port}`,
         username: username,
-        password: password
+        password: password,
+        bypass: 'localhost,127.0.0.1' // Don't proxy localhost traffic (extension's proxy server)
     };
 }
 
@@ -159,16 +161,22 @@ function getOtpFromEmail(imapConfig, targetEmail, timeout = 120000) {
 
 // Single account session manager
 class AccountSession {
-    constructor(accountId, account, config, browser, proxy = null) {
+    constructor(accountId, account, config, browser, proxy = null, extensionPath = null) {
         this.accountId = accountId;
         this.account = account;
         this.config = config;
-        this.browser = browser;
+        this.browser = browser; // null in extension mode
         this.proxy = proxy ? parseProxy(proxy) : null;
+        this.extensionPath = extensionPath; // Path to unpacked extension folder
+        this.isPersistentContext = false; // Track if using persistent context
         this.context = null;
         this.page = null;
         this.lastLoginTime = null;
         this.csrfToken = null; // Store CSRF token for requests
+
+        // Interview booking state
+        this.interviewConfig = null;
+        this.interviewPollingActive = false;
 
         // Initialize NopeCHA solver if configured
         this.nopecha = null;
@@ -228,16 +236,8 @@ class AccountSession {
             // Default to en-US for US proxies or unknown
         }
         
-        const contextOptions = {
-            viewport: viewport,
-            userAgent: userAgent,
-            locale: locale,
-            timezoneId: timezoneId
-        };
-        
         // Add proxy if available
         if (this.proxy) {
-            contextOptions.proxy = this.proxy;
             log('INFO', `Using proxy: ${this.proxy.server}`, this.accountId);
             log('DEBUG', `Proxy username: ${this.proxy.username ? this.proxy.username.substring(0, 3) + '***' : 'not set'}`, this.accountId);
             log('DEBUG', `Proxy password: ${this.proxy.password ? '***' : 'not set'}`, this.accountId);
@@ -246,19 +246,78 @@ class AccountSession {
             log('INFO', 'No proxy configured for this account', this.accountId);
             log('DEBUG', `Locale: ${locale}, Timezone: ${timezoneId} (default)`, this.accountId);
         }
-        
+
         log('DEBUG', `Viewport: ${viewport.width}x${viewport.height}`, this.accountId);
         log('DEBUG', `User-Agent: ${userAgent}`, this.accountId);
-        
-        this.context = await this.browser.newContext(contextOptions);
-        
-        // Set geolocation to null to deny location access
+
+        if (this.extensionPath) {
+            // ===== EXTENSION MODE: launchPersistentContext =====
+            // Each account gets its own browser + Chrome profile with extension loaded
+            const userDataDir = path.join(os.tmpdir(), `chrome-ext-profile-account-${this.accountId}`);
+
+            // Clean profile directory to avoid restore dialogs
+            if (fs.existsSync(userDataDir)) {
+                try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (e) {}
+            }
+            fs.mkdirSync(userDataDir, { recursive: true });
+
+            const extPath = path.resolve(this.extensionPath);
+            log('INFO', `Extension mode: loading extension from ${extPath}`, this.accountId);
+            log('INFO', `Chrome profile: ${userDataDir}`, this.accountId);
+
+            const launchOptions = {
+                headless: false, // Extensions REQUIRE headed mode
+                viewport: viewport,
+                userAgent: userAgent,
+                locale: locale,
+                timezoneId: timezoneId,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    `--disable-extensions-except=${extPath}`,
+                    `--load-extension=${extPath}`,
+                    // Bypass proxy for localhost so extension can reach local proxy server
+                    '--proxy-bypass-list=localhost;127.0.0.1',
+                ]
+            };
+
+            if (this.proxy) {
+                launchOptions.proxy = this.proxy;
+            }
+
+            this.context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+            this.isPersistentContext = true;
+
+            // Persistent context may already have a page open
+            const existingPages = this.context.pages();
+            this.page = existingPages.length > 0 ? existingPages[0] : await this.context.newPage();
+
+            log('INFO', `Persistent context launched with extension (${existingPages.length} existing pages)`, this.accountId);
+        } else {
+            // ===== STANDARD MODE: shared browser + newContext =====
+            const contextOptions = {
+                viewport: viewport,
+                userAgent: userAgent,
+                locale: locale,
+                timezoneId: timezoneId
+            };
+
+            if (this.proxy) {
+                contextOptions.proxy = this.proxy;
+            }
+
+            this.context = await this.browser.newContext(contextOptions);
+            this.page = await this.context.newPage();
+        }
+
+        // Set geolocation to deny location access
         await this.context.setGeolocation({ latitude: 0, longitude: 0 });
         await this.context.setExtraHTTPHeaders({
             'Accept-Language': `${locale},${locale.split('-')[0]};q=0.9`
         });
-        
-        this.page = await this.context.newPage();
         
         // IMPORTANT: Do NOT use page.route() to intercept/modify requests.
         // Playwright's route.continue({ headers }) REPLACES all browser-managed headers,
@@ -2448,6 +2507,426 @@ class AccountSession {
         }
     }
 
+    /**
+     * Auto-bootstrap: after login, extract tokens from localStorage + cookies
+     * and POST to the proxy server so the extension's job poller can use them.
+     * This replaces the manual "Import" button click in the sidepanel.
+     */
+    async bootstrapSession() {
+        try {
+            // Wait for page to settle and localStorage to be populated
+            await this.page.waitForTimeout(5000);
+
+            // Make sure we're on hiring.amazon.ca (not auth page)
+            const currentUrl = this.page.url();
+            if (currentUrl.includes('auth.hiring.amazon')) {
+                log('INFO', 'Still on auth page, navigating to dashboard...', this.accountId);
+                await this.page.goto('https://hiring.amazon.ca', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                await this.page.waitForTimeout(3000);
+            }
+
+            // Extract candidateId from localStorage
+            const candidateId = await this.page.evaluate(() => {
+                return localStorage.getItem('bbCandidateId') ||
+                       localStorage.getItem('sfCandidateId') ||
+                       localStorage.getItem('CandidateId');
+            });
+
+            // Extract accessToken from localStorage
+            const accessToken = await this.page.evaluate(() => {
+                return localStorage.getItem('accessToken');
+            });
+
+            if (!candidateId || !accessToken) {
+                log('WARNING', `Bootstrap skipped: candidateId=${!!candidateId}, accessToken=${!!accessToken}`, this.accountId);
+                return false;
+            }
+
+            log('INFO', `Tokens found: candidateId=${candidateId.substring(0, 10)}..., token=${accessToken.substring(0, 15)}...`, this.accountId);
+
+            // Get cookies from browser context
+            const allCookies = await this.context.cookies();
+            const cookies = allCookies
+                .filter(c => c.domain.includes('hiring.amazon.com') || c.domain.includes('hiring.amazon.ca'))
+                .map(c => ({
+                    name: c.name, value: c.value, domain: c.domain,
+                    path: c.path || '/',
+                    expires: c.expires > 0 ? Math.floor(c.expires) : undefined,
+                    httpOnly: c.httpOnly, secure: c.secure,
+                    sameSite: c.sameSite === 'None' ? 'None' : c.sameSite === 'Lax' ? 'Lax' : 'Strict'
+                }));
+
+            // POST to proxy server bootstrap endpoint
+            const http = require('http');
+            const postData = JSON.stringify({ candidateId, accessToken, cookies, csrf: null });
+
+            const success = await new Promise((resolve) => {
+                const req = http.request('http://localhost:8080/bootstrap', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) }
+                }, (res) => {
+                    let body = '';
+                    res.on('data', chunk => body += chunk);
+                    res.on('end', () => {
+                        if (res.statusCode === 200) {
+                            log('INFO', `Auto-bootstrap SUCCESS — session registered with proxy server`, this.accountId);
+                            resolve(true);
+                        } else {
+                            log('WARNING', `Bootstrap returned ${res.statusCode}: ${body}`, this.accountId);
+                            resolve(false);
+                        }
+                    });
+                });
+                req.on('error', (e) => {
+                    log('WARNING', `Bootstrap request failed: ${e.message} (proxy server might not be running)`, this.accountId);
+                    resolve(false);
+                });
+                req.write(postData);
+                req.end();
+            });
+
+            return success;
+        } catch (error) {
+            log('WARNING', `Bootstrap error: ${error.message}`, this.accountId);
+            return false;
+        }
+    }
+
+    /**
+     * Interview Slot Auto-Booker (NHE Page)
+     * Opens a new tab, navigates to the NHE interview scheduling page,
+     * and polls for available appointment slots. Books the first slot found.
+     *
+     * @param {Object} interviewConfig - { application_id, job_id, schedule_id, poll_interval_ms, max_poll_minutes }
+     */
+    async startInterviewBooking(interviewConfig) {
+        const { application_id, job_id, schedule_id } = interviewConfig;
+        const pollInterval = interviewConfig.poll_interval_ms || 2000;
+        const maxMinutes = interviewConfig.max_poll_minutes || 120;
+        const maxAttempts = Math.floor((maxMinutes * 60 * 1000) / Math.max(pollInterval, 500));
+
+        const isUS = job_id.includes('JOB-US-');
+        const domain = isUS ? 'hiring.amazon.com' : 'hiring.amazon.ca';
+        const cc = isUS ? 'us' : 'ca';
+        const nheUrl = `https://${domain}/application/${cc}/?applicationId=${application_id}&jobId=${job_id}#/nhe?applicationId=${application_id}&jobId=${job_id}&scheduleId=${schedule_id}`;
+
+        log('INFO', `=== INTERVIEW BOOKER STARTED ===`, this.accountId);
+        log('INFO', `NHE URL: ${nheUrl}`, this.accountId);
+        log('INFO', `Poll interval: ${pollInterval}ms, Max: ${maxMinutes} min`, this.accountId);
+
+        // Open a new tab in the same browser context (shares login session)
+        let nhePage;
+        try {
+            nhePage = await this.context.newPage();
+        } catch (e) {
+            log('ERROR', `Failed to open new tab for NHE: ${e.message}`, this.accountId);
+            return false;
+        }
+
+        // Intercept API responses to discover NHE endpoints
+        const discoveredApis = [];
+        nhePage.on('response', async (response) => {
+            const url = response.url();
+            // Log any API calls related to NHE, appointments, shifts, schedules
+            if (url.includes('/api/') && (
+                url.includes('nhe') || url.includes('appointment') ||
+                url.includes('shift') || url.includes('schedule') ||
+                url.includes('get-application') || url.includes('update-application')
+            )) {
+                const method = response.request().method();
+                const status = response.status();
+                try {
+                    const text = await response.text().catch(() => '');
+                    const body = text ? JSON.parse(text) : null;
+                    discoveredApis.push({ url, method, status, body });
+                    log('INFO', `[NHE API] ${method} ${url.substring(0, 120)} → ${status}`, this.accountId);
+                    if (body && typeof body === 'object') {
+                        const preview = JSON.stringify(body).substring(0, 300);
+                        log('INFO', `[NHE Response] ${preview}`, this.accountId);
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            }
+        });
+
+        // Navigate to NHE page
+        try {
+            await nhePage.goto(nheUrl, { waitUntil: 'networkidle', timeout: 30000 });
+            log('INFO', `NHE page loaded: ${nhePage.url()}`, this.accountId);
+        } catch (e) {
+            log('ERROR', `Failed to load NHE page: ${e.message}`, this.accountId);
+            await nhePage.close().catch(() => {});
+            return false;
+        }
+
+        // Wait a moment for the SPA to render
+        await nhePage.waitForTimeout(3000);
+
+        // Polling loop
+        let attempt = 0;
+        let booked = false;
+
+        while (attempt < maxAttempts && !booked) {
+            attempt++;
+
+            try {
+                const pageState = await nhePage.evaluate(() => {
+                    const bodyText = (document.body?.innerText || '').toLowerCase();
+
+                    // 1. Check for "no appointments" message
+                    if (bodyText.includes('no appointments available') ||
+                        bodyText.includes('there are no appointments')) {
+                        return { state: 'no_slots' };
+                    }
+
+                    // 2. Check for error/login redirect
+                    if (bodyText.includes('sign in') || bodyText.includes('log in')) {
+                        return { state: 'login_required' };
+                    }
+
+                    // 3. Look for clickable appointment/shift cards
+                    // Amazon NHE pages use various selectors — try many patterns
+                    const cardSelectors = [
+                        '[data-testid*="nhe-card"]',
+                        '[data-testid*="appointment-card"]',
+                        '[data-testid*="shift-card"]',
+                        '[data-testid*="time-slot"]',
+                        '[data-test-component*="NheAppointmentCard"]',
+                        '[data-test-component*="ShiftCard"]',
+                        '.nhe-card', '.appointment-card', '.shift-card',
+                        '[class*="appointmentCard"]', '[class*="shiftCard"]',
+                        '[class*="nheCard"]', '[class*="TimeSlot"]',
+                        '[class*="timeslot"]', '[class*="SlotCard"]',
+                    ];
+
+                    for (const sel of cardSelectors) {
+                        const els = document.querySelectorAll(sel);
+                        if (els.length > 0) {
+                            return {
+                                state: 'slots_found',
+                                count: els.length,
+                                selector: sel,
+                                firstText: (els[0].innerText || '').substring(0, 120)
+                            };
+                        }
+                    }
+
+                    // 4. Look for any radio buttons or selectable items that contain time info
+                    const radios = document.querySelectorAll('input[type="radio"], [role="radio"]');
+                    if (radios.length > 0) {
+                        const parent = radios[0].closest('label, div, li');
+                        return {
+                            state: 'radio_slots',
+                            count: radios.length,
+                            firstText: (parent?.innerText || '').substring(0, 120)
+                        };
+                    }
+
+                    // 5. Look for buttons with time-related text (AM/PM, Select, Book)
+                    const allBtns = document.querySelectorAll('button, [role="button"], a.btn, a[class*="btn"]');
+                    for (const btn of allBtns) {
+                        const txt = (btn.innerText || '').trim();
+                        if (/\d{1,2}:\d{2}/.test(txt) || /\b(AM|PM)\b/i.test(txt) ||
+                            /\b(select|book|choose|reserve)\b/i.test(txt.toLowerCase())) {
+                            return {
+                                state: 'button_slots',
+                                text: txt.substring(0, 120),
+                                tag: btn.tagName,
+                                classes: btn.className?.substring(0, 80) || ''
+                            };
+                        }
+                    }
+
+                    // 6. Unknown state — return page snippet for debugging
+                    return {
+                        state: 'unknown',
+                        snippet: bodyText.substring(0, 300)
+                    };
+                });
+
+                // Handle page states
+                if (pageState.state === 'no_slots') {
+                    if (attempt % 30 === 1) {
+                        log('INFO', `[NHE] No slots available (attempt ${attempt}/${maxAttempts}), refreshing...`, this.accountId);
+                    }
+                    await nhePage.reload({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+                    await nhePage.waitForTimeout(pollInterval);
+                    continue;
+                }
+
+                if (pageState.state === 'login_required') {
+                    log('WARNING', `[NHE] Login required — session may have expired. Will retry after next re-login cycle.`, this.accountId);
+                    await nhePage.close().catch(() => {});
+                    return false;
+                }
+
+                if (pageState.state === 'slots_found') {
+                    log('INFO', `[NHE] 🎯 SLOTS FOUND! Count: ${pageState.count}, Selector: ${pageState.selector}`, this.accountId);
+                    log('INFO', `[NHE] First slot: ${pageState.firstText}`, this.accountId);
+
+                    // Click the first slot
+                    try {
+                        await nhePage.click(`${pageState.selector}`, { timeout: 5000 });
+                        log('INFO', `[NHE] Clicked slot: ${pageState.selector}`, this.accountId);
+                        await nhePage.waitForTimeout(1500);
+                        booked = await this._tryConfirmBooking(nhePage);
+                    } catch (e) {
+                        log('ERROR', `[NHE] Click failed: ${e.message}`, this.accountId);
+                    }
+                    continue;
+                }
+
+                if (pageState.state === 'radio_slots') {
+                    log('INFO', `[NHE] 🎯 RADIO SLOTS FOUND! Count: ${pageState.count}`, this.accountId);
+                    log('INFO', `[NHE] First slot: ${pageState.firstText}`, this.accountId);
+
+                    try {
+                        const radioSel = 'input[type="radio"], [role="radio"]';
+                        await nhePage.click(radioSel, { timeout: 5000 });
+                        log('INFO', `[NHE] Selected radio slot`, this.accountId);
+                        await nhePage.waitForTimeout(1500);
+                        booked = await this._tryConfirmBooking(nhePage);
+                    } catch (e) {
+                        log('ERROR', `[NHE] Radio click failed: ${e.message}`, this.accountId);
+                    }
+                    continue;
+                }
+
+                if (pageState.state === 'button_slots') {
+                    log('INFO', `[NHE] 🎯 BUTTON SLOT FOUND: "${pageState.text}" (${pageState.tag})`, this.accountId);
+
+                    try {
+                        // Click the button that has time text
+                        const clicked = await nhePage.evaluate((txt) => {
+                            const btns = document.querySelectorAll('button, [role="button"], a.btn, a[class*="btn"]');
+                            for (const btn of btns) {
+                                if (btn.innerText.trim().includes(txt.substring(0, 20))) {
+                                    btn.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }, pageState.text);
+
+                        if (clicked) {
+                            log('INFO', `[NHE] Clicked button slot`, this.accountId);
+                            await nhePage.waitForTimeout(1500);
+                            booked = await this._tryConfirmBooking(nhePage);
+                        }
+                    } catch (e) {
+                        log('ERROR', `[NHE] Button click failed: ${e.message}`, this.accountId);
+                    }
+                    continue;
+                }
+
+                if (pageState.state === 'unknown') {
+                    if (attempt % 60 === 1) {
+                        log('INFO', `[NHE] Unknown page state (attempt ${attempt}): ${pageState.snippet}`, this.accountId);
+                    }
+                    await nhePage.reload({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+                    await nhePage.waitForTimeout(pollInterval);
+                    continue;
+                }
+
+            } catch (evalError) {
+                if (attempt % 30 === 1) {
+                    log('WARNING', `[NHE] Evaluation error (attempt ${attempt}): ${evalError.message}`, this.accountId);
+                }
+                await nhePage.reload({ waitUntil: 'networkidle', timeout: 20000 }).catch(() => {});
+                await nhePage.waitForTimeout(pollInterval);
+            }
+        }
+
+        if (booked) {
+            log('INFO', `=== INTERVIEW BOOKED SUCCESSFULLY! ===`, this.accountId);
+            // Take screenshot proof
+            try {
+                const screenshotPath = path.join(process.cwd(), `interview_booked_${Date.now()}.png`);
+                await nhePage.screenshot({ path: screenshotPath });
+                log('INFO', `Screenshot saved: ${screenshotPath}`, this.accountId);
+            } catch (e) {}
+        } else {
+            log('WARNING', `[NHE] Max attempts (${maxAttempts}) reached. Interview NOT booked.`, this.accountId);
+        }
+
+        // Keep NHE tab open for user to see result
+        if (discoveredApis.length > 0) {
+            log('INFO', `[NHE] Discovered ${discoveredApis.length} API calls:`, this.accountId);
+            discoveredApis.forEach((api, i) => {
+                log('INFO', `  ${i + 1}. ${api.method} ${api.url.substring(0, 120)} → ${api.status}`, this.accountId);
+            });
+        }
+
+        return booked;
+    }
+
+    /**
+     * Try to find and click a confirm/continue/book button after selecting a slot
+     */
+    async _tryConfirmBooking(nhePage) {
+        const confirmPatterns = [
+            'button:has-text("Confirm")',
+            'button:has-text("Book")',
+            'button:has-text("Continue")',
+            'button:has-text("Select this")',
+            'button:has-text("Reserve")',
+            'button:has-text("Next")',
+            'button:has-text("Submit")',
+            '[data-testid*="confirm"]',
+            '[data-testid*="book"]',
+            '[data-testid*="submit"]',
+            '[data-testid*="continue"]',
+        ];
+
+        for (const sel of confirmPatterns) {
+            try {
+                const btn = await nhePage.$(sel);
+                if (btn) {
+                    const isVisible = await btn.isVisible().catch(() => false);
+                    const isEnabled = await btn.isEnabled().catch(() => false);
+                    if (isVisible && isEnabled) {
+                        await btn.click();
+                        log('INFO', `[NHE] ✅ Confirm button clicked: ${sel}`, this.accountId);
+                        await nhePage.waitForTimeout(3000);
+
+                        // Check if booking succeeded (no error message)
+                        const result = await nhePage.evaluate(() => {
+                            const text = (document.body?.innerText || '').toLowerCase();
+                            if (text.includes('successfully') || text.includes('confirmed') ||
+                                text.includes('booked') || text.includes('scheduled') ||
+                                text.includes('congratulations') || text.includes('you are all set')) {
+                                return 'success';
+                            }
+                            if (text.includes('error') || text.includes('failed') ||
+                                text.includes('no longer available') || text.includes('no appointments')) {
+                                return 'failed';
+                            }
+                            return 'unknown';
+                        });
+
+                        if (result === 'success') {
+                            log('INFO', `[NHE] ✅ BOOKING CONFIRMED!`, this.accountId);
+                            return true;
+                        } else if (result === 'failed') {
+                            log('WARNING', `[NHE] Booking failed after clicking confirm. Retrying...`, this.accountId);
+                            return false;
+                        } else {
+                            // Take screenshot for debugging and assume success
+                            log('INFO', `[NHE] Confirm clicked, result unclear. Taking screenshot...`, this.accountId);
+                            const ssPath = path.join(process.cwd(), `nhe_confirm_${Date.now()}.png`);
+                            await nhePage.screenshot({ path: ssPath }).catch(() => {});
+                            return true; // Optimistic — user can verify
+                        }
+                    }
+                }
+            } catch (e) { /* try next selector */ }
+        }
+
+        log('WARNING', `[NHE] No confirm button found after selecting slot`, this.accountId);
+        const ssPath = path.join(process.cwd(), `nhe_no_confirm_${Date.now()}.png`);
+        await nhePage.screenshot({ path: ssPath }).catch(() => {});
+        return false;
+    }
+
     async runCycle() {
         try {
             // Ensure page is initialized
@@ -2460,7 +2939,6 @@ class AccountSession {
 
             // Amazon hiring tokens expire after ~2 hours.
             // Always perform a full re-login to get a fresh token/session.
-            // This keeps the account continuously logged in.
             const timeSinceLogin = this.lastLoginTime
                 ? (Date.now() - this.lastLoginTime.getTime()) / 1000 / 60
                 : Infinity;
@@ -2483,6 +2961,30 @@ class AccountSession {
             log('INFO', 'Performing full re-login to refresh session token...', this.accountId);
             const result = await this.login();
             log('INFO', `Login result: ${result}`, this.accountId);
+
+            // Auto-bootstrap: register new session with proxy server after successful login
+            if (result) {
+                await this.bootstrapSession();
+            }
+
+            // Interview booking: if configured for this account and not already running
+            if (result && this.interviewConfig && !this.interviewPollingActive) {
+                this.interviewPollingActive = true;
+                log('INFO', 'Starting interview booking in background...', this.accountId);
+                // Run in background — don't block the re-login cycle
+                this.startInterviewBooking(this.interviewConfig)
+                    .then(booked => {
+                        if (booked) {
+                            log('INFO', '🎉 INTERVIEW BOOKED! Check screenshots for confirmation.', this.accountId);
+                        }
+                        this.interviewPollingActive = false;
+                    })
+                    .catch(err => {
+                        log('ERROR', `Interview booking error: ${err.message}`, this.accountId);
+                        this.interviewPollingActive = false;
+                    });
+            }
+
             return result;
         } catch (error) {
             log('ERROR', `Cycle error: ${error.message}`, this.accountId);
@@ -2510,6 +3012,10 @@ class AccountSession {
             }
             if (this.context) {
                 await this.context.close();
+                // For persistent context, close() also closes the underlying browser
+                if (this.isPersistentContext) {
+                    log('INFO', 'Persistent context + browser closed', this.accountId);
+                }
             }
         } catch (error) {
             log('ERROR', `Cleanup error: ${error.message}`, this.accountId);
@@ -2530,7 +3036,27 @@ class AutoLoginManager {
         this.watcher = null;
         this.shouldRestart = false;
         this.isRunning = false;
-        this.concurrentLimit = this.config.timing.concurrent_limit || 10; // Process 10 accounts at a time
+        this.concurrentLimit = this.config.timing.concurrent_limit || 10;
+
+        // Extension mode: if extension_path is set in config, load extension in each browser
+        this.extensionPath = this.config.extension_path || null;
+        if (this.extensionPath) {
+            const resolvedPath = path.resolve(this.extensionPath);
+            if (!fs.existsSync(resolvedPath)) {
+                log('ERROR', `Extension path not found: ${resolvedPath}`);
+                log('ERROR', 'Set "extension_path" to the folder containing your extension manifest.json');
+                throw new Error(`Extension path not found: ${resolvedPath}`);
+            }
+            const manifestPath = path.join(resolvedPath, 'manifest.json');
+            if (!fs.existsSync(manifestPath)) {
+                log('ERROR', `No manifest.json found in extension path: ${resolvedPath}`);
+                throw new Error(`No manifest.json found in: ${resolvedPath}`);
+            }
+            this.extensionPath = resolvedPath;
+            log('INFO', `Extension mode enabled: ${this.extensionPath}`);
+            log('INFO', 'Each account will launch its own browser with the extension loaded');
+            log('INFO', 'Note: Extensions require headed mode (headless: false)');
+        }
     }
     
     _loadProxies() {
@@ -2597,30 +3123,31 @@ class AutoLoginManager {
     }
 
     async initBrowser() {
+        // In extension mode, each account launches its own browser via launchPersistentContext
+        // No shared browser needed
+        if (this.extensionPath) {
+            log('INFO', 'Extension mode: skipping shared browser (each account gets its own browser)');
+            return;
+        }
+
         // Auto-detect dev mode: check for nodemon in process title or NODE_ENV
-        // When running via "npm run dev", nodemon will be in the process title
         const isDevMode = process.title.toLowerCase().includes('nodemon') ||
                          process.env.NODE_ENV === 'development' ||
                          process.env.npm_lifecycle_event === 'dev';
-        
-        // Default to non-headless (headless: false) to avoid bot detection
-        // Many sites flag headless browsers. Set HEADLESS=true to enable headless mode.
-        // For testing, always use headless: false to verify behavior
+
         const headless = process.env.HEADLESS === 'true';
-        
-        // Check if browser is installed using Playwright's chromium executablePath
+
+        // Check if browser is installed
         try {
             const executablePath = chromium.executablePath();
             if (!executablePath || !fs.existsSync(executablePath)) {
                 throw new Error('Browser executable not found');
             }
         } catch (error) {
-            log('ERROR', 'Playwright browser not found. Please install browsers first.');
-            log('ERROR', 'Run: npm run install-browsers');
-            log('ERROR', 'Or: npx playwright install chromium');
-            throw new Error('Playwright browsers not installed. Run "npm run install-browsers" to install them.');
+            log('ERROR', 'Playwright browser not found. Run: npx playwright install chromium');
+            throw new Error('Playwright browsers not installed.');
         }
-        
+
         try {
             this.browser = await chromium.launch({
                 headless: headless,
@@ -2635,10 +3162,8 @@ class AutoLoginManager {
             log('INFO', `Browser initialized (headless: ${headless}${isDevMode ? ', dev mode' : ''})`);
         } catch (error) {
             if (error.message.includes('Executable doesn\'t exist') || error.message.includes('executable')) {
-                log('ERROR', 'Playwright browser not found. Please install browsers first.');
-                log('ERROR', 'Run: npm run install-browsers');
-                log('ERROR', 'Or: npx playwright install chromium');
-                throw new Error('Playwright browsers not installed. Run "npm run install-browsers" to install them.');
+                log('ERROR', 'Playwright browser not found. Run: npx playwright install chromium');
+                throw new Error('Playwright browsers not installed.');
             }
             throw error;
         }
@@ -2673,9 +3198,24 @@ class AutoLoginManager {
                 log('INFO', `Account ${i + 1} assigned random proxy: ${proxyInfo[0]}:${proxyInfo[1]}`);
             }
             
-            const session = new AccountSession(i + 1, account, this.config, this.browser, proxy);
+            const session = new AccountSession(i + 1, account, this.config, this.browser, proxy, this.extensionPath);
+
+            // Assign interview config if this account is designated for interview booking
+            if (this.config.interview && this.config.interview.enabled) {
+                const targetIndex = this.config.interview.account_index || 0;
+                if (i === targetIndex) {
+                    session.interviewConfig = this.config.interview;
+                    log('INFO', `Account ${i + 1} designated for interview booking: ${this.config.interview.job_id}`);
+                }
+            }
+
             await session.initContext();
             this.accounts.push(session);
+
+            // Small delay between browser launches in extension mode to avoid resource spikes
+            if (this.extensionPath && i < this.config.accounts.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
         }
         
         log('INFO', `All ${this.accounts.length} accounts initialized`);
@@ -2718,18 +3258,19 @@ class AutoLoginManager {
     }
 
     async processAllAccounts() {
-        const batches = [];
-        for (let i = 0; i < this.accounts.length; i += this.concurrentLimit) {
-            const batch = this.accounts.slice(i, i + this.concurrentLimit);
-            batches.push(batch);
-        }
+        // Process in small batches of 3 to balance speed vs OTP safety.
+        // Each batch of 3 runs concurrently, then 2s gap before next batch.
+        // 11 accounts → 4 batches → finishes much faster than 1-by-1.
+        const batchSize = this.concurrentLimit || 3;
 
-        log('INFO', `Processing ${this.accounts.length} accounts in ${batches.length} batches (${this.concurrentLimit} concurrent)`);
+        log('INFO', `Processing ${this.accounts.length} accounts in batches of ${batchSize}`);
 
-        for (let i = 0; i < batches.length; i++) {
-            await this.processAccountsBatch(batches[i], i + 1);
-            // Small delay between batches to avoid overwhelming the server
-            if (i < batches.length - 1) {
+        for (let i = 0; i < this.accounts.length; i += batchSize) {
+            const batch = this.accounts.slice(i, i + batchSize);
+            const batchNum = Math.floor(i / batchSize) + 1;
+            await this.processAccountsBatch(batch, batchNum);
+
+            if (i + batchSize < this.accounts.length) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
         }
@@ -2783,6 +3324,10 @@ class AutoLoginManager {
 
             log('INFO', 'Starting multi-account auto-login service');
             log('INFO', `Managing ${this.accounts.length} accounts`);
+            log('INFO', `Mode: ${this.extensionPath ? 'EXTENSION (each account has own browser + extension)' : 'STANDARD (shared browser)'}`);
+            if (this.extensionPath) {
+                log('INFO', `Extension: ${this.extensionPath}`);
+            }
             log('INFO', `Max runtime: ${this.config.timing.max_runtime_hours === 0 ? 'UNLIMITED (until you close)' : this.config.timing.max_runtime_hours + ' hours'}`);
             log('INFO', `Re-login interval: ${this.config.timing.login_interval_hours} hours (Amazon tokens expire at 2h)`);
             log('INFO', `Concurrent limit: ${this.concurrentLimit} accounts per batch`);
@@ -2849,10 +3394,12 @@ class AutoLoginManager {
                 this.accounts.map(account => account.cleanup())
             );
 
-            if (this.browser) {
+            // Only close shared browser in standard mode
+            // In extension mode, each account's cleanup() closes its own browser
+            if (this.browser && !this.extensionPath) {
                 await this.browser.close();
             }
-            
+
             log('INFO', 'Cleanup completed');
             if (!this.shouldRestart) {
                 logFile.end();
