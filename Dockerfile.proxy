@@ -1,0 +1,22 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY server/package*.json ./
+RUN npm ci
+
+# Copy source and build
+COPY server/tsconfig.json ./
+COPY server/src ./src
+RUN npm run build
+
+# Remove dev dependencies and source files
+RUN npm prune --production
+RUN rm -rf src tsconfig.json
+
+# Expose port
+EXPOSE 8080
+
+# Start server
+CMD ["node", "dist/index.js"]

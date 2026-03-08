@@ -1,17 +1,36 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  auto-login:
-    build: .
-    container_name: auto-login-service
-    volumes:
-      - ./config.json:/app/config.json
-      - ./logs:/app/logs
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  proxy:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.proxy
     environment:
-      - TZ=UTC
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - REDIS_URL=redis://redis:6379
+      - PER_ID_RPS=150
+      - PER_ID_BURST=300
+      - GLOBAL_RPS=1500
+      - GLOBAL_BURST=3000
+      - ROTATION_BACKOFF_MS=10000
+      - ROTATION_BACKOFF_MAX_MS=20000
+      - PORT=8080
+    depends_on:
+      - redis
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+
+
+
